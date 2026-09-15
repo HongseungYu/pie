@@ -46,8 +46,12 @@ pub fn uncached(file: &std::fs::File) -> bool {
     #[cfg(target_vendor = "apple")]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: fcntl on a live descriptor with an integer argument.
-        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) == 0 }
+        // SAFETY: fcntl on a live descriptor with an integer argument. With
+        // `F_RDAHEAD` off a 32 KiB read stays a 32 KiB read.
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) == 0
+                && libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) == 0
+        }
     }
     #[cfg(not(target_vendor = "apple"))]
     {
