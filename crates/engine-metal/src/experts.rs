@@ -38,8 +38,33 @@ pub const CACHE_ENV: &str = "PIE_EXPERT_CACHE";
 pub const HEADROOM_ENV: &str = "PIE_EXPERT_CACHE_HEADROOM";
 pub const LOG_ENV: &str = "PIE_EXPERT_CACHE_LOG";
 pub const NOCACHE_ENV: &str = "PIE_EXPERT_CACHE_NOCACHE";
+pub const PREFILL_ENV: &str = "PIE_EXPERT_CACHE_PREFILL";
 pub const REPORT_ENV: &str = "PIE_EXPERT_CACHE_REPORT";
+/// A row routes to `top_k` of `experts`, so `rows` rows name about
+/// `experts * (1 - exp(-rows * top_k / experts))` distinct experts: the
+/// union passes 80% of the layer at `rows = 1.6 * experts / top_k`. Below
+/// that a whole-layer read moves bytes no matmul asks for, so the ring's
+/// own threshold is that, rounded to 2.
+const PREFILL_UNION: u32 = 2;
+const PREFILL_FLOOR: u32 = 32;
 const DEFAULT_REPORT_EVERY: u64 = 256;
+
+/// Rows in one lane from which a fire counts as prefill and runs its routed
+/// matmuls over the ring (a whole layer at a time, filled one layer ahead).
+/// `PIE_EXPERT_CACHE_PREFILL=<rows>` states it, `=0` drops the ring.
+#[must_use]
+pub fn prefill_min(experts: u32, top_k: u32) -> u32 {
+    let derived = (PREFILL_UNION * experts)
+        .div_ceil(top_k.max(1))
+        .max(PREFILL_FLOOR);
+    match std::env::var(PREFILL_ENV) {
+        Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "false" | "no" => 0,
+            other => other.parse::<u32>().unwrap_or(derived),
+        },
+        Err(_) => derived,
+    }
+}
 
 /// Fires between one `expert-cache:` line on stderr and the next; 0 leaves
 /// only the shutdown line. `PIE_EXPERT_CACHE_REPORT=<n>`.
@@ -188,6 +213,8 @@ pub struct Plan {
     resident_of: BTreeMap<usize, u32>,
     host_of: BTreeMap<usize, u64>,
     slots: u32,
+    ring: u32,
+    prefill_min: u32,
     per_slot: u64,
     pairs: u64,
     policy: String,
@@ -368,33 +395,50 @@ impl Plan {
             .find(|&n| pass_group(n) >= fan)
             .unwrap_or(fan);
         let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
+        let experts = groups[0].experts;
+        let prefill_min = prefill_min(experts, fan);
+        // The prefill ring: two whole layers of seats past the pool's own.
+        let ring = if prefill_min > 0 { 2 * experts } else { 0 };
         let ceiling = u32::try_from(pairs).unwrap_or(u32::MAX).max(need);
+        // The most seats, ring included, whose bytes fit `usable`.
         let largest = |usable: u64| -> u32 {
             let mut n = u32::try_from(usable / seats(1).max(1))
                 .unwrap_or(u32::MAX)
-                .min(ceiling);
-            while n > need && seats(n) > usable {
+                .min(ceiling + ring);
+            while n > need + ring && seats(n) > usable {
                 n -= 1;
             }
             n
+        };
+        let ring_note = || {
+            if ring > 0 {
+                format!(
+                    " and a prefill ring of {ring} seats ({:.2} GiB; `{PREFILL_ENV}=0` drops \
+                     it)",
+                    gib(seats(ring))
+                )
+            } else {
+                String::new()
+            }
         };
 
         let (slots, word) = match policy {
             Policy::Off => return Ok(whole("off: every expert resident")),
             Policy::Budget(budget) => {
-                let floor = dense + seats(need);
+                let floor = dense + seats(need + ring);
                 if budget < floor {
                     return Err(Fault::Residency(format!(
                         "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
                          demand {dense} resident and its {} routed bands need {need} expert \
                          seats in the shared pool on top (a row routes to {fan} experts and a \
-                         pass seats half the pool), which is {floor}. Dense planes do not \
+                         pass seats half the pool){}, which is {floor}. Dense planes do not \
                          stream in this build, so the budget cannot be met by holding less. \
                          Raise it to at least {floor}, or state `None`.",
                         bands.len(),
+                        ring_note(),
                     )));
                 }
-                let slots = largest(budget - dense);
+                let slots = largest(budget - dense) - ring;
                 (slots, format!("budget {:.2} GiB", gib(budget)))
             }
             Policy::Slots(n) => {
@@ -417,22 +461,23 @@ impl Plan {
                     )
                 })?;
                 let usable = free.saturating_sub(headroom).saturating_sub(dense);
-                let slots = largest(usable);
-                if seats(slots) > usable || slots < need {
+                let total = largest(usable);
+                if seats(total) > usable || total < need + ring {
                     return Err(Fault::Residency(format!(
                         "free RAM is {:.2} GiB; less the {:.2} GiB headroom and the {:.2} \
                          GiB of dense planes, {:.2} GiB is left, and the pool needs at least \
-                         {need} seats of {:.2} MiB. Lower `{HEADROOM_ENV}`, or state \
+                         {need} seats of {:.2} MiB{}. Lower `{HEADROOM_ENV}`, or state \
                          `{CACHE_ENV}=<seats>` to size the pool by hand.",
                         gib(free),
                         gib(headroom),
                         gib(dense),
                         gib(usable),
                         per_slot as f64 / (1u64 << 20) as f64,
+                        ring_note(),
                     )));
                 }
                 (
-                    slots,
+                    total - ring,
                     format!(
                         "auto: free {:.2} GiB - headroom {:.2} GiB - dense {:.2} GiB",
                         gib(free),
@@ -450,7 +495,11 @@ impl Plan {
         for group in &mut groups {
             group.slots = slots;
         }
-        let resident_of = bands.iter().map(|band| (band.param, slots)).collect();
+        // The reservation a band's region is placed at: the pool and the ring.
+        let resident_of = bands
+            .iter()
+            .map(|band| (band.param, slots + ring))
+            .collect();
         let mut host_bytes = 0u64;
         let mut host_of = BTreeMap::new();
         for band in &bands {
@@ -458,7 +507,7 @@ impl Plan {
             host_bytes += u64::from(band.experts) * band.stride;
         }
         Ok(Plan {
-            device_bytes: dense + seats(slots),
+            device_bytes: dense + seats(slots + ring),
             bands,
             groups,
             regions,
@@ -466,6 +515,8 @@ impl Plan {
             resident_of,
             host_of,
             slots,
+            ring,
+            prefill_min,
             per_slot,
             pairs,
             policy: word,
@@ -517,6 +568,19 @@ impl Plan {
         self.pairs
     }
 
+    /// Seats past the pool's own that hold the prefill ring (two whole
+    /// layers), or 0 without one.
+    #[must_use]
+    pub fn ring(&self) -> u32 {
+        self.ring
+    }
+
+    /// Rows in one lane from which a fire takes the ring.
+    #[must_use]
+    pub fn prefill_min(&self) -> u32 {
+        self.prefill_min
+    }
+
     /// The param whose reservation this streamed param aliases, if it is not
     /// its region's head.
     #[must_use]
@@ -556,9 +620,19 @@ impl Plan {
         if !self.streams() {
             return format!("expert cache off ({})", self.policy);
         }
+        let ring = if self.ring > 0 {
+            format!(
+                " + a prefill ring of {} seats ({:.2} GiB) from {} rows a lane",
+                self.ring,
+                gib(u64::from(self.ring) * self.per_slot),
+                self.prefill_min
+            )
+        } else {
+            String::new()
+        };
         format!(
             "expert cache: {} seats x {:.2} MiB = {:.2} GiB shared by {} groups over {} \
-             (layer, expert) pairs [{}]",
+             (layer, expert) pairs{ring} [{}]",
             self.slots,
             self.per_slot as f64 / (1u64 << 20) as f64,
             gib(u64::from(self.slots) * self.per_slot),
@@ -934,6 +1008,27 @@ impl Pool {
     }
 }
 
+/// Two full-layer buffers past the pool's seats, for prefill. A fire in
+/// which some lane has `min_rows` rows or more names nearly every expert of
+/// every layer, so its routed matmuls run over a buffer holding the whole
+/// layer (seat = `base + half * experts + expert`, the LRU untouched), and
+/// the next layer's buffer fills while this one computes: experts the pool
+/// holds are copied from their seats, the rest are read. After llama.cpp's
+/// expert store (`TAG_MOE_STORE_PREFILL`) and FreeToken's prefill.
+#[derive(Debug)]
+struct Ring {
+    base: u32,
+    experts: u32,
+    holds: [Option<usize>; 2],
+    filling: Option<(usize, usize, std::thread::JoinHandle<Result<()>>)>,
+    fills: u64,
+    copied: u64,
+    read: u64,
+    bytes: u64,
+    lookups: u64,
+    wait_ns: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupResidency {
     pub name: String,
@@ -1037,6 +1132,7 @@ pub struct Tier {
     source: Source,
     groups: Vec<Group>,
     pool: Pool,
+    ring: Option<Ring>,
     of_routes: BTreeMap<u32, usize>,
     swaps: u64,
     segments: u64,
@@ -1089,6 +1185,11 @@ pub struct CacheReport {
     pub copy_ns: u64,
     pub wait_ns: u64,
     pub gpu_ns: u64,
+    pub ring_fills: u64,
+    pub ring_copied: u64,
+    pub ring_read: u64,
+    pub ring_bytes: u64,
+    pub ring_wait_ns: u64,
 }
 
 impl std::fmt::Display for CacheReport {
@@ -1119,7 +1220,20 @@ impl std::fmt::Display for CacheReport {
             self.copy_ns as f64 / 1e6,
             self.wait_ns as f64 / 1e6,
             self.gpu_ns as f64 / 1e6,
-        )
+        )?;
+        if self.ring_fills > 0 {
+            write!(
+                f,
+                "; prefill ring: {} fills, {} experts copied from seats, {} read ({:.3} GiB), \
+                 {:.1} ms waited for a fill",
+                self.ring_fills,
+                self.ring_copied,
+                self.ring_read,
+                gib(self.ring_bytes),
+                self.ring_wait_ns as f64 / 1e6,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -1206,6 +1320,18 @@ impl Tier {
             source,
             groups: Vec::with_capacity(plan.groups.len()),
             pool: Pool::new(plan.slots),
+            ring: (plan.ring > 0).then(|| Ring {
+                base: plan.slots,
+                experts: plan.groups.first().map_or(0, |group| group.experts),
+                holds: [None, None],
+                filling: None,
+                fills: 0,
+                copied: 0,
+                read: 0,
+                bytes: 0,
+                lookups: 0,
+                wait_ns: 0,
+            }),
             of_routes: BTreeMap::new(),
             swaps: 0,
             segments: 0,
@@ -1292,6 +1418,9 @@ impl Tier {
         Ok(tier)
     }
 
+    /// Seat this segment's routed experts and rewrite its routing vector to
+    /// seat numbers. `whole` says the fire is a prefill one (some lane has
+    /// the ring's row count or more), which takes the ring when there is one.
     #[allow(clippy::too_many_arguments)]
     pub fn segment(
         &mut self,
@@ -1302,12 +1431,13 @@ impl Tier {
         hint: Option<Tensor>,
         span: MaskSpan,
         pass: (u32, u32),
+        whole: bool,
     ) -> Result<u32> {
         let Some(&at) = self.of_routes.get(&routes.0) else {
             return Ok(1);
         };
         let started = std::time::Instant::now();
-        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, pass);
+        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, pass, whole);
         self.cut_ns += started.elapsed().as_nanos() as u64;
         out
     }
@@ -1412,13 +1542,58 @@ impl Tier {
         hint: Option<Tensor>,
         span: MaskSpan,
         pass: (u32, u32),
+        whole: bool,
     ) -> Result<u32> {
         self.join_inflight()?;
+        if whole && self.ring.is_some() {
+            return self.ring_at(at, arena, handles, routes, rect, span);
+        }
         if pass.1 > 1 {
             return self.pass_at(at, arena, handles, routes, rect, span, pass);
         }
         self.segment_rows(at, arena, handles, routes, rect, hint, span)?;
         Ok(1)
+    }
+
+    /// The routing vector's rows as raw bytes, and where they live.
+    fn routing_bytes(
+        arena: &mut Buffer,
+        handles: &Handles,
+        routes: ValueId,
+        rect: Tensor,
+        span: MaskSpan,
+    ) -> Result<(u64, Vec<u8>)> {
+        let width = u64::from(rect.width);
+        let base = handles
+            .get(rect.buf)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "handle {}, the routing vector of value {}, which this fire minted no \
+                     row for",
+                    rect.buf, routes.0
+                ),
+            })?
+            .offset();
+        let first = base + u64::from(span.row_offset) * width * 4;
+        let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
+        let mut raw = vec![0u8; count * 4];
+        arena.read(first, &mut raw)?;
+        Ok((first, raw))
+    }
+
+    fn dump_rows(&mut self, at: usize, raw: &[u8], width: usize) {
+        if let Some(dump) = &mut self.dump {
+            use std::io::Write;
+            for row in raw.chunks_exact(width * 4) {
+                let ids: Vec<String> = row
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]).to_string())
+                    .collect();
+                let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1443,33 +1618,8 @@ impl Tier {
         if span.rows == 0 {
             return Ok(());
         }
-        let width = u64::from(rect.width);
-        let base = {
-            let row = handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "handle {}, the routing vector of value {}, which this fire minted no \
-                     row for",
-                    rect.buf, routes.0
-                ),
-            })?;
-            row.offset()
-        };
-        let first = base + u64::from(span.row_offset) * width * 4;
-        let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
-        let mut raw = vec![0u8; count * 4];
-        arena.read(first, &mut raw)?;
-        if let Some(dump) = &mut self.dump {
-            use std::io::Write;
-            for row in raw.chunks_exact(width as usize * 4) {
-                let ids: Vec<String> = row
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]).to_string())
-                    .collect();
-                let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
-            }
-        }
+        let (first, mut raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
+        self.dump_rows(at, &raw, rect.width as usize);
         for entry in raw.as_chunks_mut::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
@@ -1515,38 +1665,20 @@ impl Tier {
             return Ok(0);
         }
         let width = u64::from(rect.width);
-        let base = handles
-            .get(rect.buf)
-            .ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "handle {}, the routing vector of value {}, which this fire minted no \
-                     row for",
-                    rect.buf, routes.0
-                ),
-            })?
-            .offset();
-        let first = base + u64::from(span.row_offset) * width * 4;
         let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
         let fresh = pass == 0
             || self.passing[at]
                 .as_ref()
                 .is_none_or(|p| p.row_offset != span.row_offset || p.rows != span.rows);
-        if fresh {
-            let mut raw = vec![0u8; count * 4];
-            arena.read(first, &mut raw)?;
+        let first = if fresh {
+            let (first, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
+            self.dump_rows(at, &raw, width as usize);
             let ids: Vec<i32> = raw
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]))
                 .collect();
-            if let Some(dump) = &mut self.dump {
-                use std::io::Write;
-                for row in ids.chunks_exact(width as usize) {
-                    let ids: Vec<String> = row.iter().map(ToString::to_string).collect();
-                    let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
-                }
-            }
             let mut order: Vec<u32> = Vec::new();
             for &id in &ids {
                 if id < 0 {
@@ -1578,7 +1710,17 @@ impl Tier {
                 ids,
                 groups,
             });
-        }
+            first
+        } else {
+            let row = handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "handle {}, the routing vector of value {}, which this fire minted no \
+                     row for",
+                    rect.buf, routes.0
+                ),
+            })?;
+            row.offset() + u64::from(span.row_offset) * width * 4
+        };
         let (ids, group, next) = {
             let state = self.passing[at].as_ref().expect("stated just above");
             (
@@ -1625,6 +1767,180 @@ impl Tier {
         Ok(self.passing[at]
             .as_ref()
             .map_or(0, |p| p.groups.len() as u32))
+    }
+
+    /// A prefill segment: the layer's matmuls run over the ring half that
+    /// holds the whole layer, and the next layer's half fills meanwhile.
+    fn ring_at(
+        &mut self,
+        at: usize,
+        arena: &mut Buffer,
+        handles: &Handles,
+        routes: ValueId,
+        rect: Tensor,
+        span: MaskSpan,
+    ) -> Result<u32> {
+        self.pool.pinned.fill(false);
+        self.segments += 1;
+        let half = self.ring_ready(at)?;
+        if span.rows > 0 {
+            let (first, mut raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
+            self.dump_rows(at, &raw, rect.width as usize);
+            let (base, experts) = {
+                let ring = self.ring.as_ref().expect("the caller checked");
+                (ring.base + half as u32 * ring.experts, ring.experts)
+            };
+            let mut lookups = 0u64;
+            for entry in raw.as_chunks_mut::<4>().0 {
+                let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+                if id < 0 {
+                    continue;
+                }
+                let expert = id as u32;
+                if expert >= experts {
+                    return Err(Fault::Residency(format!(
+                        "a routing vector names expert {expert} and `{}` declares {} of them; \
+                         the prefill ring holds no such expert.",
+                        self.groups[at].bands[0].name, experts
+                    )));
+                }
+                entry.copy_from_slice(&((base + expert) as i32).to_le_bytes());
+                lookups += 1;
+            }
+            arena.write(first, &raw)?;
+            if let Some(ring) = self.ring.as_mut() {
+                ring.lookups += lookups;
+            }
+        }
+        if at + 1 < self.groups.len() && !self.ring_has(at + 1) {
+            self.ring_fill(at + 1, 1 - half)?;
+        }
+        Ok(1)
+    }
+
+    fn ring_has(&self, group: usize) -> bool {
+        self.ring.as_ref().is_some_and(|ring| {
+            ring.holds.contains(&Some(group))
+                || ring.filling.as_ref().is_some_and(|(g, _, _)| *g == group)
+        })
+    }
+
+    /// Join the fill in flight, if any, and note which half it landed in.
+    fn ring_join(&mut self, wanted: usize) -> Result<()> {
+        let Some(ring) = self.ring.as_mut() else {
+            return Ok(());
+        };
+        let Some((group, half, handle)) = ring.filling.take() else {
+            return Ok(());
+        };
+        let started = std::time::Instant::now();
+        let landed = handle.join().unwrap_or_else(|_| {
+            Err(Fault::Residency(
+                "the prefill ring's fill thread panicked".to_string(),
+            ))
+        });
+        if group == wanted {
+            ring.wait_ns += started.elapsed().as_nanos() as u64;
+        }
+        landed?;
+        ring.holds[half] = Some(group);
+        Ok(())
+    }
+
+    /// The half holding group `at`, filling it now if no fill was ahead.
+    fn ring_ready(&mut self, at: usize) -> Result<usize> {
+        self.ring_join(at)?;
+        let held = self
+            .ring
+            .as_ref()
+            .and_then(|ring| ring.holds.iter().position(|g| *g == Some(at)));
+        if let Some(half) = held {
+            return Ok(half);
+        }
+        // Nothing was ahead of this layer (the first store layer of a fire):
+        // fill and wait. Either half is free — the cut waited for the device —
+        // but keep the one the previous layer used if it is still wanted.
+        let half = usize::from(
+            self.ring
+                .as_ref()
+                .is_some_and(|ring| at > 0 && ring.holds[0] == Some(at - 1)),
+        );
+        self.ring_fill(at, half)?;
+        self.ring_join(at)?;
+        Ok(half)
+    }
+
+    /// Fill `half` of the ring with every expert of `group`, in the
+    /// background: seats the pool holds are copied, the rest are read.
+    fn ring_fill(&mut self, group: usize, half: usize) -> Result<()> {
+        let Some(file) = self.file.clone() else {
+            return Err(Fault::Residency(
+                "the prefill ring reads whole layers from a file, and this tier's seat \
+                 source is not one"
+                    .to_string(),
+            ));
+        };
+        let (base, experts) = {
+            let ring = self.ring.as_ref().expect("the caller checked");
+            (ring.base + half as u32 * ring.experts, ring.experts)
+        };
+        let mut copies: Vec<Job> = Vec::new();
+        let mut reads: Vec<Job> = Vec::new();
+        let (mut copied, mut read) = (0u64, 0u64);
+        {
+            let held = &self.groups[group];
+            for expert in 0..experts.min(held.experts) {
+                let dst = base + expert;
+                match held.seat_of[expert as usize] {
+                    Some(seat) => {
+                        copied += 1;
+                        for band in &held.bands {
+                            copies.push((
+                                band.at + u64::from(dst) * band.stride,
+                                band.at + u64::from(seat) * band.stride,
+                                band.stride,
+                            ));
+                        }
+                    }
+                    None => {
+                        read += 1;
+                        for band in &held.bands {
+                            reads.push((
+                                band.at + u64::from(dst) * band.stride,
+                                band.from + u64::from(expert) * band.stride,
+                                band.stride,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let copiers = self.store.copiers(&copies)?;
+        let writers = self.store.file_writers(&reads)?;
+        let threads = self.threads;
+        let bytes: u64 = reads.iter().map(|&(_, _, len)| len).sum();
+        self.bytes_read += bytes;
+        self.swaps += (copies.len() + reads.len()) as u64;
+        if let Some(ring) = self.ring.as_mut() {
+            ring.fills += 1;
+            ring.copied += copied;
+            ring.read += read;
+            ring.bytes += bytes;
+            ring.holds[half] = None;
+        }
+        let handle = std::thread::spawn(move || {
+            for (copier, jobs) in &copiers {
+                copier.copy(jobs, threads)?;
+            }
+            for (writer, jobs) in &writers {
+                writer.pread(&file, jobs, threads)?;
+            }
+            Ok(())
+        });
+        if let Some(ring) = self.ring.as_mut() {
+            ring.filling = Some((group, half, handle));
+        }
+        Ok(())
     }
 
     /// The copy jobs that land `expert` of group `at` in `seat`: one per band.
@@ -1824,6 +2140,7 @@ impl Tier {
 
     #[must_use]
     pub fn report(&self) -> CacheReport {
+        let ring = self.ring.as_ref();
         CacheReport {
             policy: self.policy.clone(),
             slots: self.pool.slots,
@@ -1838,6 +2155,11 @@ impl Tier {
             copy_ns: self.copy_ns,
             wait_ns: self.wait_ns,
             gpu_ns: self.gpu_ns,
+            ring_fills: ring.map_or(0, |r| r.fills),
+            ring_copied: ring.map_or(0, |r| r.copied),
+            ring_read: ring.map_or(0, |r| r.read),
+            ring_bytes: ring.map_or(0, |r| r.bytes),
+            ring_wait_ns: ring.map_or(0, |r| r.wait_ns),
         }
     }
 
@@ -1894,6 +2216,11 @@ impl Tier {
 impl Drop for Tier {
     fn drop(&mut self) {
         let _ = self.join_inflight();
+        if let Some(ring) = self.ring.as_mut()
+            && let Some((_, _, handle)) = ring.filling.take()
+        {
+            let _ = handle.join();
+        }
         if self.segments > 0 {
             eprintln!("{}", self.report());
         }

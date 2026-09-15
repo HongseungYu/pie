@@ -303,6 +303,9 @@ pub struct Shell {
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
     run_passes: Vec<u32>,
+    /// Rows in one lane from which a fire is prefill and takes the ring; 0
+    /// when the tier has no ring.
+    ring_min: u32,
     expert_fires: std::cell::Cell<u64>,
     /// Device time of the fires' final frames, summed as they land.
     gpu_tail_ns: std::cell::Cell<u64>,
@@ -483,6 +486,11 @@ impl Shell {
                 }
             })
             .collect();
+        let ring_min = if boot.residency.ring() > 0 {
+            boot.residency.prefill_min()
+        } else {
+            0
+        };
         if crate::diag::on().cut_trace {
             let capped: Vec<(usize, u32, u32)> = run_caps
                 .iter()
@@ -989,6 +997,7 @@ impl Shell {
             row_cuts,
             run_caps,
             run_passes,
+            ring_min,
             expert_fires: std::cell::Cell::new(0),
             gpu_tail_ns: std::cell::Cell::new(0),
             held: vec![0; boot.slots as usize],
@@ -2581,8 +2590,16 @@ impl Shell {
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let mut descriptor = FireDescriptor::of(&composition);
-        descriptor.run_caps = self.run_caps.clone();
-        descriptor.run_passes = self.run_passes.clone();
+        // A prefill fire runs its routed matmuls over the ring, which holds
+        // every expert of the layer: no row cap and no passes for it.
+        let whole = self.ring_min > 0 && lane_rows.iter().any(|&rows| rows >= self.ring_min);
+        let (run_caps, run_passes) = if whole {
+            (vec![0; self.run_caps.len()], vec![0; self.run_passes.len()])
+        } else {
+            (self.run_caps.clone(), self.run_passes.clone())
+        };
+        descriptor.run_caps = run_caps.clone();
+        descriptor.run_passes = run_passes.clone();
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
@@ -2916,8 +2933,8 @@ impl Shell {
                 positions: &positions,
                 request_of_token: &request_of_token,
             },
-            &self.run_caps,
-            &self.run_passes,
+            &run_caps,
+            &run_passes,
         )?;
         self.last = FireCost {
             launches: windows.launches(),
@@ -3476,6 +3493,7 @@ impl Shell {
         };
 
         Ok(Prepared {
+            whole,
             lanes,
             self_cond_feeds,
             port_feeds,
@@ -3810,6 +3828,7 @@ impl Shell {
                 self.arena.store().clone(),
                 tier,
                 rows,
+                p.whole,
             ),
         ));
         {
@@ -4045,6 +4064,7 @@ pub struct Prepared<'a> {
     caches: CacheTable,
     bindings: FireBindings,
     demand: Demand,
+    whole: bool,
 }
 
 impl PreparedPhase for Prepared<'_> {

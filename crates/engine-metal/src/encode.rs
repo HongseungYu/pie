@@ -61,6 +61,9 @@ pub struct Cuts<'a> {
     rows: Option<&'a RefCell<crate::gather::Slab>>,
     seen: std::cell::Cell<(u32, u32)>,
     groups: std::cell::Cell<u32>,
+    /// A prefill fire: some lane has the ring's row count or more, so every
+    /// streamed segment runs over the ring rather than the pool.
+    whole: bool,
 }
 
 impl<'a> Cuts<'a> {
@@ -75,6 +78,7 @@ impl<'a> Cuts<'a> {
         arena: Buffer,
         tier: Option<&'a RefCell<Tier>>,
         rows: Option<&'a RefCell<crate::gather::Slab>>,
+        whole: bool,
     ) -> Cuts<'a> {
         Cuts {
             place,
@@ -87,6 +91,7 @@ impl<'a> Cuts<'a> {
             rows,
             seen: std::cell::Cell::new((u32::MAX, u32::MAX)),
             groups: std::cell::Cell::new(1),
+            whole,
         }
     }
 }
@@ -167,8 +172,16 @@ impl<'a> Sink<'a> {
             routes,
             "a routing vector",
             |rect, span, pass, arena| {
-                tier.borrow_mut()
-                    .segment(arena, self.handles, routes, rect, hint, span, pass)
+                tier.borrow_mut().segment(
+                    arena,
+                    self.handles,
+                    routes,
+                    rect,
+                    hint,
+                    span,
+                    pass,
+                    cuts.whole,
+                )
             },
         )
     }

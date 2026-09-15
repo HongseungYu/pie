@@ -220,6 +220,27 @@ impl Buffer {
         writer.pread(file, jobs, threads)
     }
 
+    /// A copier over this reservation: every job's source and destination
+    /// span lies inside it. `FileWriter::copy` moves the bytes.
+    pub fn copier(&mut self, jobs: &[(u64, u64, u64)]) -> Result<FileWriter> {
+        self.writable("copy")?;
+        for &(into, from, len) in jobs {
+            self.span(into, len)?;
+            self.span(from, len)?;
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            Ok(FileWriter {
+                base: self.slab.contents().as_ptr() as usize,
+                _keep: self.slab.clone(),
+            })
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Fault::Deviceless)
+        }
+    }
+
     pub fn file_writer(&mut self, jobs: &[(u64, u64, u64)]) -> Result<FileWriter> {
         self.writable("write_from_file")?;
         for &(into, _, len) in jobs {
@@ -251,6 +272,46 @@ pub struct FileWriter {
 unsafe impl Send for FileWriter {}
 
 impl FileWriter {
+    /// Seat-to-seat copies inside the reservation, `threads` at a time.
+    pub fn copy(&self, jobs: &[(u64, u64, u64)], threads: usize) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_vendor = "apple")]
+        {
+            let base = self.base;
+            let threads = threads.clamp(1, jobs.len());
+            let per = jobs.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                for chunk in jobs.chunks(per) {
+                    scope.spawn(move || {
+                        for &(into, from, len) in chunk {
+                            let at = |offset: u64| {
+                                base + usize::try_from(offset)
+                                    .expect("an offset inside a live mapping")
+                            };
+                            // SAFETY: both spans were proved inside the live
+                            // mapping by `copier`; `copy` tolerates overlap.
+                            unsafe {
+                                std::ptr::copy(
+                                    at(from) as *const u8,
+                                    at(into) as *mut u8,
+                                    usize::try_from(len).expect("a length inside a live mapping"),
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = threads;
+            Err(Fault::Deviceless)
+        }
+    }
+
     pub fn pread(
         &self,
         file: &std::fs::File,

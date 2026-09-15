@@ -136,6 +136,32 @@ impl Store {
         Ok(out)
     }
 
+    /// Writers for seat-to-seat copies: each job's source and destination
+    /// must lie in one chunk of the store.
+    pub fn copiers(&mut self, jobs: &[Job]) -> Result<Writes> {
+        let mut groups: Grouped = Vec::new();
+        for &(into, from, len) in jobs {
+            let (at, local_into) = self.locate(into, len)?;
+            let (from_at, local_from) = self.locate(from, len)?;
+            if from_at != at {
+                return Err(Fault::Residency(format!(
+                    "a seat copy from {from} to {into} crosses two chunks of the weight \
+                     store; the pool's regions are not one buffer here"
+                )));
+            }
+            match groups.iter_mut().find(|(chunk, _)| *chunk == at) {
+                Some((_, list)) => list.push((local_into, local_from, len)),
+                None => groups.push((at, vec![(local_into, local_from, len)])),
+            }
+        }
+        let mut out = Vec::new();
+        for (at, local) in groups {
+            let writer = self.chunks[at].buffer.copier(&local)?;
+            out.push((writer, local));
+        }
+        Ok(out)
+    }
+
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
