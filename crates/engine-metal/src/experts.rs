@@ -964,6 +964,7 @@ pub struct Tier {
     cut_ns: u64,
     copy_ns: u64,
     wait_ns: u64,
+    gpu_ns: u64,
     hint_of: BTreeMap<u32, ValueId>,
     predicted: Vec<Option<Vec<Vec<u32>>>>,
     passing: Vec<Option<Passing>>,
@@ -999,6 +1000,7 @@ pub struct CacheReport {
     pub segments: u64,
     pub copy_ns: u64,
     pub wait_ns: u64,
+    pub gpu_ns: u64,
 }
 
 impl std::fmt::Display for CacheReport {
@@ -1014,7 +1016,7 @@ impl std::fmt::Display for CacheReport {
             "expert-cache: {} seats x {:.2} MiB ({:.2} GiB) over {} (layer, expert) pairs \
              [{}]; {} resident, {} distinct ever seated; {} hits / {} misses ({rate:.1}% hit) \
              across {} segments; {:.3} GiB read from disk ({:.1} ms copying, {:.1} ms waiting \
-             on the device)",
+             on the device, {:.1} ms of device time in the cut frames)",
             self.slots,
             self.per_slot as f64 / (1u64 << 20) as f64,
             gib(u64::from(self.slots) * self.per_slot),
@@ -1028,6 +1030,7 @@ impl std::fmt::Display for CacheReport {
             gib(self.bytes_read),
             self.copy_ns as f64 / 1e6,
             self.wait_ns as f64 / 1e6,
+            self.gpu_ns as f64 / 1e6,
         )
     }
 }
@@ -1045,6 +1048,11 @@ pub struct FireRecord {
     pub copy_ms: f64,
     pub wait_ms: f64,
     pub walk_ms: f64,
+    /// Device time of this fire's cut frames (every frame but the last).
+    pub gpu_cut_ms: f64,
+    /// Device time of final frames that landed since the previous record:
+    /// the fire before this one, in steady decode.
+    pub gpu_tail_ms: f64,
 }
 
 type FireLog = std::sync::Mutex<(u64, std::io::BufWriter<std::fs::File>)>;
@@ -1057,7 +1065,8 @@ fn fire_log() -> Option<&'static FireLog> {
         let mut file = std::io::BufWriter::new(std::fs::File::create(&path).ok()?);
         let _ = writeln!(
             file,
-            "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms"
+            "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms,\
+             gpu_cut_ms,gpu_tail_ms"
         );
         let _ = file.flush();
         Some(std::sync::Mutex::new((0, file)))
@@ -1076,7 +1085,7 @@ pub fn log_fire(record: &FireRecord) {
     let (seq, file) = &mut *log;
     let _ = writeln!(
         file,
-        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
+        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         record.rows,
         record.cuts,
         record.copies,
@@ -1087,6 +1096,8 @@ pub fn log_fire(record: &FireRecord) {
         record.copy_ms,
         record.wait_ms,
         record.walk_ms,
+        record.gpu_cut_ms,
+        record.gpu_tail_ms,
     );
     let _ = file.flush();
     *seq += 1;
@@ -1121,6 +1132,7 @@ impl Tier {
             cut_ns: 0,
             copy_ns: 0,
             wait_ns: 0,
+            gpu_ns: 0,
             hint_of: plan
                 .groups
                 .iter()
@@ -1748,6 +1760,7 @@ impl Tier {
             segments: self.segments,
             copy_ns: self.copy_ns,
             wait_ns: self.wait_ns,
+            gpu_ns: self.gpu_ns,
         }
     }
 
@@ -1778,6 +1791,16 @@ impl Tier {
 
     pub fn note_wait(&mut self, ns: u64) {
         self.wait_ns += ns;
+    }
+
+    /// Device time of a cut frame, as the command buffer reports it.
+    pub fn note_gpu(&mut self, ns: u64) {
+        self.gpu_ns += ns;
+    }
+
+    #[must_use]
+    pub fn gpu_ns(&self) -> u64 {
+        self.gpu_ns
     }
 
     #[must_use]

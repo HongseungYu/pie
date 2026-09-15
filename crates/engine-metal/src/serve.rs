@@ -303,6 +303,8 @@ pub struct Shell {
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
     run_passes: Vec<u32>,
+    /// Device time of the fires' final frames, summed as they land.
+    gpu_tail_ns: std::cell::Cell<u64>,
     held: Vec<u32>,
     out: Option<ValueId>,
     mtp: Option<ValueId>,
@@ -986,6 +988,7 @@ impl Shell {
             row_cuts,
             run_caps,
             run_passes,
+            gpu_tail_ns: std::cell::Cell::new(0),
             held: vec![0; boot.slots as usize],
             out,
             mtp,
@@ -1424,6 +1427,12 @@ impl Shell {
             .map_or((0, 0), |tier| tier.borrow().hits())
     }
 
+    /// Device time the expert pool's cut frames have taken so far.
+    #[must_use]
+    pub fn expert_gpu(&self) -> u64 {
+        self.weights.tier().map_or(0, |tier| tier.borrow().gpu_ns())
+    }
+
     /// Bytes the expert pool has read from disk so far.
     #[must_use]
     pub fn expert_bytes(&self) -> u64 {
@@ -1593,6 +1602,11 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
+        {
+            let (start, end) = flight.pending.gpu_span_us();
+            self.gpu_tail_ns
+                .set(self.gpu_tail_ns.get() + end.saturating_sub(start) * 1000);
+        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
@@ -4115,6 +4129,8 @@ impl engine::frame::Shell for Shell {
                     self.expert_hits(),
                     self.expert_bytes(),
                     self.expert_host_time(),
+                    self.expert_gpu(),
+                    self.gpu_tail_ns.get(),
                     std::time::Instant::now(),
                 )
             });
@@ -4124,6 +4140,8 @@ impl engine::frame::Shell for Shell {
                 (hits0, misses0),
                 bytes0,
                 (cut0, copy0, wait0),
+                gpu0,
+                tail0,
                 started,
             )) = before
             {
@@ -4141,13 +4159,15 @@ impl engine::frame::Shell for Shell {
                     copy_ms: (copy_ns - copy0) as f64 / 1e6,
                     wait_ms: (wait_ns - wait0) as f64 / 1e6,
                     walk_ms: started.elapsed().as_secs_f64() * 1e3,
+                    gpu_cut_ms: (self.expert_gpu() - gpu0) as f64 / 1e6,
+                    gpu_tail_ms: (self.gpu_tail_ns.get() - tail0) as f64 / 1e6,
                 };
                 crate::experts::log_fire(&record);
                 if trace {
                     eprintln!(
                         "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} \
                          misses, {:.1} MiB read; cuts {:.1} ms (copies {:.1} ms, waiting on \
-                         the device {:.1} ms); walk {:.1} ms",
+                         the device {:.1} ms, {:.1} ms of device time); walk {:.1} ms",
                         record.rows,
                         record.copies,
                         record.cuts,
@@ -4157,6 +4177,7 @@ impl engine::frame::Shell for Shell {
                         record.cut_ms,
                         record.copy_ms,
                         record.wait_ms,
+                        record.gpu_cut_ms,
                         record.walk_ms,
                     );
                 }

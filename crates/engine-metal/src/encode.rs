@@ -213,10 +213,12 @@ impl<'a> Sink<'a> {
             .take()
             .expect("a segment is open until its cut closes it");
         let waited = std::time::Instant::now();
-        frame.commit().map_err(refuse)?;
+        let gpu = frame.commit_timed().map_err(refuse)?;
         let waited = waited.elapsed();
         if let Some(tier) = cuts.tier {
-            tier.borrow_mut().note_wait(waited.as_nanos() as u64);
+            let mut tier = tier.borrow_mut();
+            tier.note_wait(waited.as_nanos() as u64);
+            tier.note_gpu((gpu.max(0.0) * 1e9) as u64);
         }
         if crate::diag::on().cut_trace {
             eprintln!("cut-wait: {:.1} ms", waited.as_secs_f64() * 1e3);
