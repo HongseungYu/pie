@@ -1092,7 +1092,9 @@ const PREFETCH_K: usize = 4;
 
 pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
 
-const SEAT_THREADS: usize = 8;
+/// Threads the seat copies run on. llama.cpp's expert store measured 16
+/// ahead of 8 on this class of SSD for whole-expert requests.
+const SEAT_THREADS: usize = 16;
 
 impl Tier {
     pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
