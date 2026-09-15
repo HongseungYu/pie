@@ -303,6 +303,7 @@ pub struct Shell {
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
     run_passes: Vec<u32>,
+    expert_fires: std::cell::Cell<u64>,
     /// Device time of the fires' final frames, summed as they land.
     gpu_tail_ns: std::cell::Cell<u64>,
     held: Vec<u32>,
@@ -988,6 +989,7 @@ impl Shell {
             row_cuts,
             run_caps,
             run_passes,
+            expert_fires: std::cell::Cell::new(0),
             gpu_tail_ns: std::cell::Cell::new(0),
             held: vec![0; boot.slots as usize],
             out,
@@ -4179,6 +4181,18 @@ impl engine::frame::Shell for Shell {
                         record.wait_ms,
                         record.gpu_cut_ms,
                         record.walk_ms,
+                    );
+                }
+                let fires = self.expert_fires.get() + 1;
+                self.expert_fires.set(fires);
+                let every = crate::experts::report_every();
+                if every > 0
+                    && fires.is_multiple_of(every)
+                    && let Some(report) = self.expert_cache_report()
+                {
+                    eprintln!(
+                        "{report}; {fires} fires, final frames {:.1} ms on the device",
+                        self.gpu_tail_ns.get() as f64 / 1e6
                     );
                 }
             }

@@ -38,6 +38,18 @@ pub const CACHE_ENV: &str = "PIE_EXPERT_CACHE";
 pub const HEADROOM_ENV: &str = "PIE_EXPERT_CACHE_HEADROOM";
 pub const LOG_ENV: &str = "PIE_EXPERT_CACHE_LOG";
 pub const NOCACHE_ENV: &str = "PIE_EXPERT_CACHE_NOCACHE";
+pub const REPORT_ENV: &str = "PIE_EXPERT_CACHE_REPORT";
+const DEFAULT_REPORT_EVERY: u64 = 256;
+
+/// Fires between one `expert-cache:` line on stderr and the next; 0 leaves
+/// only the shutdown line. `PIE_EXPERT_CACHE_REPORT=<n>`.
+#[must_use]
+pub fn report_every() -> u64 {
+    std::env::var(REPORT_ENV)
+        .ok()
+        .and_then(|word| word.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_REPORT_EVERY)
+}
 
 /// Ask the kernel to serve reads through `file` from the disk, not the page
 /// cache, and to cache nothing it reads (`F_NOCACHE`). Pages already cached
