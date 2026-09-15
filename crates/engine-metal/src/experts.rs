@@ -837,13 +837,24 @@ struct Group {
     ever: Vec<bool>,
 }
 
+const NONE: u32 = u32::MAX;
+
 /// The shared LRU pool: one seat holds one `(group, expert)` of any group.
+/// The seats in use sit on a doubly linked list ordered by recency, least
+/// recently used at the head, so a victim is the head rather than a scan
+/// over every seat (the scan cost llama.cpp's expert store 4 ms a step at
+/// 11k seats). Seats never used yet wait on `free` and go first.
 #[derive(Debug)]
 struct Pool {
     slots: u32,
     in_seat: Vec<Option<(u32, u32)>>,
     pinned: Vec<bool>,
-    last_used: Vec<u64>,
+    prev: Vec<u32>,
+    next: Vec<u32>,
+    linked: Vec<bool>,
+    head: u32,
+    tail: u32,
+    free: Vec<u32>,
 }
 
 impl Pool {
@@ -852,8 +863,74 @@ impl Pool {
             slots,
             in_seat: vec![None; slots as usize],
             pinned: vec![false; slots as usize],
-            last_used: vec![0; slots as usize],
+            prev: vec![NONE; slots as usize],
+            next: vec![NONE; slots as usize],
+            linked: vec![false; slots as usize],
+            head: NONE,
+            tail: NONE,
+            free: (0..slots).rev().collect(),
         }
+    }
+
+    fn unlink(&mut self, seat: u32) {
+        let s = seat as usize;
+        if !self.linked[s] {
+            return;
+        }
+        let (p, n) = (self.prev[s], self.next[s]);
+        if p == NONE {
+            self.head = n;
+        } else {
+            self.next[p as usize] = n;
+        }
+        if n == NONE {
+            self.tail = p;
+        } else {
+            self.prev[n as usize] = p;
+        }
+        self.prev[s] = NONE;
+        self.next[s] = NONE;
+        self.linked[s] = false;
+    }
+
+    fn push_back(&mut self, seat: u32) {
+        let s = seat as usize;
+        debug_assert!(!self.linked[s], "a seat is on the list once");
+        self.prev[s] = self.tail;
+        self.next[s] = NONE;
+        if self.tail == NONE {
+            self.head = seat;
+        } else {
+            self.next[self.tail as usize] = seat;
+        }
+        self.tail = seat;
+        self.linked[s] = true;
+    }
+
+    /// Most recently used, now.
+    fn bump(&mut self, seat: u32) {
+        self.unlink(seat);
+        self.push_back(seat);
+    }
+
+    /// A seat to take: one never used, else the least recently used seat
+    /// no one has pinned this segment.
+    fn victim(&mut self) -> Option<u32> {
+        if let Some(seat) = self.free.pop() {
+            return Some(seat);
+        }
+        let mut at = self.head;
+        while at != NONE {
+            if !self.pinned[at as usize] {
+                return Some(at);
+            }
+            at = self.next[at as usize];
+        }
+        None
+    }
+
+    fn resident(&self) -> u64 {
+        self.in_seat.iter().filter(|held| held.is_some()).count() as u64
     }
 }
 
@@ -965,7 +1042,6 @@ pub struct Tier {
     segments: u64,
     threads: usize,
     pending: Vec<(usize, u32, u32)>,
-    tick: u64,
     hits: u64,
     misses: u64,
     bytes_read: u64,
@@ -1133,7 +1209,6 @@ impl Tier {
             of_routes: BTreeMap::new(),
             swaps: 0,
             segments: 0,
-            tick: 1,
             hits: 0,
             misses: 0,
             bytes_read: 0,
@@ -1600,8 +1675,7 @@ impl Tier {
         let mut jobs: Vec<Job> = Vec::new();
         for expert in wanted {
             if let Some(seat) = self.groups[at].seat_of[expert as usize] {
-                self.pool.last_used[seat as usize] = self.tick;
-                self.tick += 1;
+                self.pool.bump(seat);
                 continue;
             }
             let Ok(seat) = self.place(at, expert) else {
@@ -1643,8 +1717,7 @@ impl Tier {
     }
 
     fn touch(&mut self, seat: u32) {
-        self.pool.last_used[seat as usize] = self.tick;
-        self.tick += 1;
+        self.pool.bump(seat);
         self.pool.pinned[seat as usize] = true;
     }
 
@@ -1710,20 +1783,17 @@ impl Tier {
         Ok(())
     }
 
-    /// The least recently used seat no one has pinned this segment.
+    /// A seat to reuse: never used, else the least recently used one no one
+    /// has pinned this segment.
     fn evict(&mut self, at: usize) -> Result<u32> {
-        let pool = &self.pool;
-        let victim = (0..pool.slots)
-            .filter(|&seat| !pool.pinned[seat as usize])
-            .min_by_key(|&seat| pool.last_used[seat as usize]);
-        victim.ok_or_else(|| {
+        self.pool.victim().ok_or_else(|| {
             Fault::Residency(format!(
                 "one segment of this fire routes to more than {} distinct experts of \
                  `{}`, and the shared pool seats {}: every seat is pinned by a matmul \
                  this same segment will run, so no seat can be reused. Every expert one \
                  segment reads must be resident at once — raise `{CACHE_ENV}` or \
                  `device_weight_budget`, or fire fewer tokens per step.",
-                pool.slots, self.groups[at].bands[0].name, pool.slots
+                self.pool.slots, self.groups[at].bands[0].name, self.pool.slots
             ))
         })
     }
@@ -1759,12 +1829,7 @@ impl Tier {
             slots: self.pool.slots,
             pairs: self.pairs,
             per_slot: self.per_slot,
-            resident: self
-                .pool
-                .in_seat
-                .iter()
-                .filter(|held| held.is_some())
-                .count() as u64,
+            resident: self.pool.resident(),
             distinct: self.distinct,
             hits: self.hits,
             misses: self.misses,
@@ -1854,5 +1919,36 @@ mod tests {
         if cfg!(target_vendor = "apple") {
             assert!(free_ram().is_some_and(|bytes| bytes > 0));
         }
+    }
+
+    #[test]
+    fn the_pool_evicts_least_recently_used_first() {
+        let mut pool = Pool::new(3);
+        // Never-used seats go first, in order.
+        assert_eq!(pool.victim(), Some(0));
+        pool.bump(0);
+        assert_eq!(pool.victim(), Some(1));
+        pool.bump(1);
+        assert_eq!(pool.victim(), Some(2));
+        pool.bump(2);
+        // Now the list decides: 0 is the oldest.
+        assert_eq!(pool.victim(), Some(0));
+        pool.bump(0);
+        assert_eq!(pool.victim(), Some(1));
+        // A pinned head is skipped.
+        pool.pinned[1] = true;
+        assert_eq!(pool.victim(), Some(2));
+        pool.pinned[2] = true;
+        pool.pinned[0] = true;
+        assert_eq!(pool.victim(), None);
+        // Unlinking the tail and the middle keeps the list whole.
+        pool.pinned.fill(false);
+        pool.unlink(0);
+        pool.unlink(2);
+        assert_eq!(pool.head, 1);
+        assert_eq!(pool.tail, 1);
+        pool.unlink(1);
+        assert_eq!(pool.head, NONE);
+        assert_eq!(pool.tail, NONE);
     }
 }
