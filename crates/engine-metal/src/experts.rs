@@ -39,7 +39,25 @@ pub const HEADROOM_ENV: &str = "PIE_EXPERT_CACHE_HEADROOM";
 pub const LOG_ENV: &str = "PIE_EXPERT_CACHE_LOG";
 pub const NOCACHE_ENV: &str = "PIE_EXPERT_CACHE_NOCACHE";
 
-/// Whether the tier's reads bypass the page cache (`F_NOCACHE`). On unless
+/// Ask the kernel to serve reads through `file` from the disk, not the page
+/// cache, and to cache nothing it reads (`F_NOCACHE`). Pages already cached
+/// are still used; nothing new is added. True when the kernel agreed.
+pub fn uncached(file: &std::fs::File) -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fcntl on a live descriptor with an integer argument.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) == 0 }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        let _ = file;
+        false
+    }
+}
+
+/// Whether the load's reads bypass the page cache (`F_NOCACHE`): the planes
+/// landed at load and every seat copy after. On unless
 /// `PIE_EXPERT_CACHE_NOCACHE=0`.
 #[must_use]
 pub fn nocache() -> bool {
@@ -1156,21 +1174,14 @@ impl Tier {
             .map(std::sync::Arc::new);
         if let (Some(file), Bytes::Artifact(_)) = (&tier.file, &tier.source.bytes)
             && nocache()
+            && !uncached(file)
         {
             // The seats ARE the copy the engine reads; a second copy of every
-            // expert in the page cache would only crowd out the pool. Reads
-            // through this descriptor go SSD -> seat.
-            #[cfg(target_vendor = "apple")]
-            {
-                use std::os::fd::AsRawFd;
-                // SAFETY: fcntl on a live descriptor with an integer argument.
-                let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
-                if rc != 0 {
-                    eprintln!(
-                        "engine-metal: F_NOCACHE on the artifact was refused; expert reads go through the page cache"
-                    );
-                }
-            }
+            // expert in the page cache would only crowd out the pool.
+            eprintln!(
+                "engine-metal: F_NOCACHE on the artifact was refused; expert reads go \
+                 through the page cache"
+            );
         }
         tier.source.settle();
         Ok(tier)

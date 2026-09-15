@@ -21,7 +21,7 @@ use crate::error::{Fault, Result};
 use crate::experts::{Attachments, Plan, Source, Tier};
 use crate::gather;
 use crate::host_source::HostSource;
-use crate::mapping::{self, Mapping};
+use crate::mapping::Mapping;
 use crate::run::{WeightRow, WeightTable};
 use crate::weight_store::Store;
 
@@ -36,7 +36,7 @@ pub struct AdapterPlane<'a> {
 #[derive(Debug)]
 pub struct Weights {
     store: Store,
-    mapped: Vec<Buffer>,
+    warm: bool,
     table: WeightTable,
     tier: Option<RefCell<Tier>>,
     rows: Option<RefCell<gather::Slab>>,
@@ -249,7 +249,7 @@ impl Weights {
             .transpose()?;
         Ok(Weights {
             store,
-            mapped: Vec::new(),
+            warm: false,
             table: WeightTable(weight_table),
             tier,
             rows,
@@ -261,12 +261,12 @@ impl Weights {
 
     #[must_use]
     pub fn warm(&self) -> bool {
-        !self.mapped.is_empty()
+        self.warm
     }
 
     #[must_use]
     pub fn windows(&self) -> usize {
-        self.mapped.len()
+        0
     }
 
     #[must_use]
@@ -486,7 +486,7 @@ impl Weights {
 
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        self.store.bytes() + self.mapped.iter().map(Buffer::bytes).sum::<u64>()
+        self.store.bytes()
     }
 }
 
@@ -694,11 +694,12 @@ pub(crate) fn plane_bytes(trace: &Trace) -> Result<Vec<u64>> {
 
 #[derive(Debug, Clone, Copy)]
 enum Seat {
-    Artifact(u64),
     Store(u64),
 }
 
-const PROBE: usize = 32;
+/// Threads the landing preads run on. The artifact is read once, whole
+/// plane by whole plane, so this is disk parallelism and nothing else.
+const LANDING_THREADS: usize = 8;
 
 #[allow(clippy::too_many_arguments)]
 fn warm(
@@ -742,8 +743,7 @@ fn warm(
         .collect();
 
     let mut seats = Vec::with_capacity(places.len());
-    let mut covers: Vec<(&str, u64, u64)> = Vec::with_capacity(places.len());
-    let mut objects: Vec<&str> = Vec::with_capacity(places.len());
+    let mut landing: Vec<(u64, u64, u64)> = Vec::with_capacity(places.len());
     let mut landed: Vec<TensorContract> = Vec::new();
     let mut store_bytes = 0u64;
     let mut residue_bytes = 0u64;
@@ -755,7 +755,6 @@ fn warm(
         let place = &places[index];
         if param.source == ParamSource::Registered {
             seats.push(Seat::Store(store_bytes));
-            objects.push(param.name.as_str());
             store_bytes += place.reserved;
             continue;
         }
@@ -789,7 +788,6 @@ fn warm(
             };
             landed.push(residue_of);
             seats.push(Seat::Store(store_bytes));
-            objects.push(param.name.as_str());
             store_bytes += place.reserved;
             residue_bytes += place.full;
             continue;
@@ -811,7 +809,6 @@ fn warm(
         }
         from_file[index] = Some(offset);
         stored += place.full;
-        objects.push(object);
         if place.streamed {
             if place.gathered {
                 rows_of.insert(index, offset);
@@ -835,8 +832,11 @@ fn warm(
             seats.push(Seat::Store(seat));
             continue;
         }
-        covers.push((param.name.as_str(), offset, place.full));
-        seats.push(Seat::Artifact(offset));
+        // A dense plane: its seat is a slab of the store, and the artifact's
+        // bytes are read into it once, below.
+        landing.push((store_bytes, offset, place.full));
+        seats.push(Seat::Store(store_bytes));
+        store_bytes += place.reserved;
     }
 
     if residue_bytes.saturating_mul(16) > stored {
@@ -851,44 +851,27 @@ fn warm(
     }
     let residue_planes = landed.len();
 
+    // The mapping is the tier's seat source (it reads through the file, not
+    // the pages); no plane is bound out of it, and nothing below touches a
+    // page of it, so the load leaves the page cache as it found it.
     let map = Mapping::of(path).map_err(|why| Some(why.to_string()))?;
+    if crate::experts::nocache() && !crate::experts::uncached(map.file()) {
+        eprintln!(
+            "engine-metal: F_NOCACHE on {} was refused; its planes land through the page cache",
+            path.display()
+        );
+    }
     for (index, param) in trace.params.iter().enumerate() {
         let Some(offset) = from_file[index] else {
             continue;
         };
         let length = places[index].full;
-        let from = usize::try_from(offset).unwrap_or(usize::MAX);
-        let upto = usize::try_from(offset.saturating_add(length)).unwrap_or(usize::MAX);
-        let mine = map.get(from..upto).ok_or_else(|| {
-            Some(format!(
-                "its plane `{}` lies at {offset}..{upto} and the file holds {} bytes",
-                param.name,
-                map.len(),
-            ))
-        })?;
-        let published = artifact.plane(objects[index]).map_err(|why| {
-            Some(format!(
-                "its plane `{}` has no zero-copy view ({why})",
-                param.name
-            ))
-        })?;
-        let ends = |bytes: &[u8]| {
-            let head = bytes
-                .get(..PROBE.min(bytes.len()))
-                .unwrap_or_default()
-                .to_vec();
-            let tail = bytes
-                .get(bytes.len().saturating_sub(PROBE)..)
-                .unwrap_or_default()
-                .to_vec();
-            (head, tail)
-        };
-        if published.len() != mine.len() || ends(published) != ends(mine) {
+        if offset.saturating_add(length) > map.len() {
             return Err(Some(format!(
-                "its manifest puts `{}` at {offset} and the bytes there are not the ones \
-                 the container publishes for it — two readings of one offset that do not \
-                 agree, so nothing here binds either",
+                "its plane `{}` lies at {offset}..{} and the file holds {} bytes",
                 param.name,
+                offset.saturating_add(length),
+                map.len(),
             )));
         }
     }
@@ -898,7 +881,7 @@ fn warm(
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
             Seat::Store(offset) if !place.alias => Some((offset, place.reserved)),
-            Seat::Store(_) | Seat::Artifact(_) => None,
+            Seat::Store(_) => None,
         })
         .collect();
     debug_assert_eq!(
@@ -957,44 +940,26 @@ fn warm(
             )));
         }
     }
-    let ceiling = mapping::ceiling(device.max_buffer());
-    let cuts = if plan.streams() {
-        mapping::cut_around(&map, ceiling, &covers)
-    } else {
-        mapping::cut(&map, ceiling, &covers)
-    }
-    .map_err(|why| Some(why.to_string()))?;
-    let mut files = Vec::with_capacity(cuts.len());
-    for cut in &cuts {
-        files.push(
-            Buffer::window(device, std::sync::Arc::clone(&map), *cut)
-                .map_err(|why| Some(why.to_string()))?,
+    // Land every plane the artifact holds straight into its seat: uncached
+    // preads, SSD -> buffer, one copy and no page-cache shadow of it.
+    if !landing.is_empty() {
+        let started = std::time::Instant::now();
+        let bytes: u64 = landing.iter().map(|&(_, _, len)| len).sum();
+        store
+            .write_from_file(map.file(), &landing, LANDING_THREADS)
+            .map_err(|why| Some(format!("its planes do not land ({why})")))?;
+        let took = started.elapsed().as_secs_f64();
+        eprintln!(
+            "engine-metal: landed {} plane(s), {:.2} GiB, in {took:.2} s ({:.2} GB/s, \
+             uncached preads)",
+            landing.len(),
+            bytes as f64 / (1u64 << 30) as f64,
+            bytes as f64 / took.max(1e-9) / 1e9,
         );
     }
     let row = |index: usize| -> std::result::Result<Tensor, Option<String>> {
         let place = &places[index];
         let handle = match seats[index] {
-            Seat::Artifact(offset) => {
-                let at = cuts
-                    .iter()
-                    .rposition(|cut| cut.holds(offset, place.bytes))
-                    .ok_or_else(|| {
-                        Some(format!(
-                            "`{}` lies at {offset} for {} bytes, which no one of this \
-                             artifact's {} mapped window(s) holds whole",
-                            trace.params[index].name,
-                            place.bytes,
-                            cuts.len(),
-                        ))
-                    })?;
-                let view = cuts[at].view(offset).ok_or_else(|| {
-                    Some(format!(
-                        "`{}` does not seat in its window",
-                        trace.params[index].name
-                    ))
-                })?;
-                handles.bind(&files[at], view, place.bytes)
-            }
             Seat::Store(offset) => store.bind(handles, offset, place.bytes),
         }
         .map_err(|why| {
@@ -1021,7 +986,7 @@ fn warm(
     let seated: Vec<u64> = seats
         .iter()
         .map(|seat| match seat {
-            Seat::Store(offset) | Seat::Artifact(offset) => *offset,
+            Seat::Store(offset) => *offset,
         })
         .collect();
     let tier = plan
@@ -1052,7 +1017,7 @@ fn warm(
         .map_err(|why| Some(format!("its gathered row slab does not open ({why})")))?;
     Ok(Weights {
         store,
-        mapped: files,
+        warm: true,
         table: WeightTable(table),
         tier,
         rows,
