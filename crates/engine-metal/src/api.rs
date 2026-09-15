@@ -492,6 +492,9 @@ impl Engine for Metal {
 
         residency.admit(residency_plan.device_demand(), residency_plan.host_demand())?;
         let streams = residency_plan.streams();
+        if streams || crate::diag::on().tier_trace {
+            eprintln!("engine-metal: {}", residency_plan.describe());
+        }
 
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);

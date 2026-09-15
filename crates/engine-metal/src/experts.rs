@@ -14,13 +14,149 @@ use crate::weight_store::Store;
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
+/// How many routed-expert seats the shared pool holds.
+///
+/// The pool is ONE LRU over `(layer, expert)` pairs: every group (one router
+/// and the bands it indexes) aliases the same `slots × stride` slabs, so a
+/// seat can hold any layer's expert and the layers compete for seats by
+/// recency rather than each holding a fixed share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    /// Every expert resident; no tier opens. `PIE_EXPERT_CACHE=off`.
+    Off,
+    /// The classic `[model] device_weight_budget`: as many seats as fit the
+    /// byte budget once the dense planes are paid for.
+    Budget(u64),
+    /// Exactly this many seats. `PIE_EXPERT_CACHE=<n>`.
+    Slots(u32),
+    /// Free RAM at load, less a headroom, less the dense planes, all of it
+    /// in seats. The default when nothing else is stated.
+    Auto { headroom: u64 },
+}
+
+pub const CACHE_ENV: &str = "PIE_EXPERT_CACHE";
+pub const HEADROOM_ENV: &str = "PIE_EXPERT_CACHE_HEADROOM";
+pub const LOG_ENV: &str = "PIE_EXPERT_CACHE_LOG";
+pub const NOCACHE_ENV: &str = "PIE_EXPERT_CACHE_NOCACHE";
+
+/// Whether the tier's reads bypass the page cache (`F_NOCACHE`). On unless
+/// `PIE_EXPERT_CACHE_NOCACHE=0`.
+#[must_use]
+pub fn nocache() -> bool {
+    !matches!(
+        std::env::var(NOCACHE_ENV).as_deref().map(str::trim),
+        Ok("0" | "off" | "false" | "no")
+    )
+}
+const DEFAULT_HEADROOM: u64 = 4 << 30;
+
+/// The policy this process runs under: the environment first, then the
+/// configured budget, then `Auto`.
+pub fn policy(budget: Option<u64>) -> Result<Policy> {
+    let headroom = match std::env::var(HEADROOM_ENV) {
+        Ok(word) => parse_bytes(&word).ok_or_else(|| {
+            Fault::Residency(format!(
+                "`{HEADROOM_ENV}={word}` is not a byte count; write `4GiB`, `512MiB`, or a \
+                 plain number of bytes"
+            ))
+        })?,
+        Err(_) => DEFAULT_HEADROOM,
+    };
+    if let Ok(word) = std::env::var(CACHE_ENV) {
+        let word = word.trim().to_string();
+        return match word.to_ascii_lowercase().as_str() {
+            "off" | "false" | "no" | "full" => Ok(Policy::Off),
+            "" | "auto" | "on" | "true" | "yes" => Ok(Policy::Auto { headroom }),
+            _ => word.parse::<u32>().map(Policy::Slots).map_err(|_| {
+                Fault::Residency(format!(
+                    "`{CACHE_ENV}={word}` is neither `off`, `auto`, nor a seat count"
+                ))
+            }),
+        };
+    }
+    Ok(match budget {
+        Some(budget) => Policy::Budget(budget),
+        None => Policy::Auto { headroom },
+    })
+}
+
+/// `4GiB`, `4G`, `4GB`, `512MiB`, `512M`, `1024` (bytes).
+#[must_use]
+pub fn parse_bytes(word: &str) -> Option<u64> {
+    let word = word.trim();
+    let split = word
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(word.len());
+    let (number, unit) = word.split_at(split);
+    let number: f64 = number.trim().parse().ok()?;
+    let scale: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1.0,
+        "k" | "kb" | "kib" => 1024.0,
+        "m" | "mb" | "mib" => 1024.0 * 1024.0,
+        "g" | "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    if number.is_nan() || number < 0.0 {
+        return None;
+    }
+    Some((number * scale) as u64)
+}
+
+/// Host RAM the kernel would hand out without swapping: free, inactive and
+/// speculative pages. Mach's own accounting, so it counts what `vm_stat` does.
+#[must_use]
+pub fn free_ram() -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        // SAFETY: `sysconf` takes a constant; `host_statistics64` fills a
+        // `vm_statistics64` sized by the count libc states for it, and the
+        // out-count is a local it may shrink.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return None;
+        }
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count: libc::mach_msg_type_number_t = libc::HOST_VM_INFO64_COUNT;
+        #[allow(deprecated)] // libc's mach shims; `mach2` is not a dependency here.
+        let rc = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&raw mut stats).cast::<libc::integer_t>(),
+                &raw mut count,
+            )
+        };
+        if rc != libc::KERN_SUCCESS {
+            return None;
+        }
+        let pages = u64::from(stats.free_count)
+            + u64::from(stats.inactive_count)
+            + u64::from(stats.speculative_count);
+        Some(pages.saturating_mul(page as u64))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
+
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / (1u64 << 30) as f64
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     bands: Vec<BandPlan>,
     groups: Vec<GroupPlan>,
+    regions: Vec<RegionPlan>,
+    alias_of: BTreeMap<usize, usize>,
     resident_of: BTreeMap<usize, u32>,
     host_of: BTreeMap<usize, u64>,
     slots: u32,
+    per_slot: u64,
+    pairs: u64,
+    policy: String,
     device_bytes: u64,
     host_bytes: u64,
     gathered: crate::gather::Plan,
@@ -34,6 +170,17 @@ pub struct BandPlan {
     pub slots: u32,
     pub stride: u64,
     pub group: usize,
+}
+
+/// One slab of the shared pool: every band that sits at the same position
+/// of its group and has the same per-expert stride. All of them alias one
+/// `slots × stride` reservation, placed under the `head` param.
+#[derive(Debug, Clone)]
+pub struct RegionPlan {
+    pub position: usize,
+    pub stride: u64,
+    pub head: usize,
+    pub bands: Vec<usize>,
 }
 
 #[must_use]
@@ -62,14 +209,31 @@ pub struct GroupPlan {
 }
 
 impl Plan {
+    /// A plan under an explicit budget, or full residency when there is
+    /// none. Environment-free: this is the arm tests reason about.
     pub fn of(trace: &Trace, planes: &Attachments, budget: Option<u64>) -> Result<Plan> {
-        Plan::beside(trace, planes, budget, crate::gather::Plan::default())
+        let policy = match budget {
+            Some(budget) => Policy::Budget(budget),
+            None => Policy::Off,
+        };
+        Plan::under(trace, planes, policy, crate::gather::Plan::default())
     }
 
+    /// The plan a load runs under: the environment's policy over the
+    /// configured budget.
     pub fn beside(
         trace: &Trace,
         planes: &Attachments,
         budget: Option<u64>,
+        gathered: crate::gather::Plan,
+    ) -> Result<Plan> {
+        Plan::under(trace, planes, policy(budget)?, gathered)
+    }
+
+    pub fn under(
+        trace: &Trace,
+        planes: &Attachments,
+        policy: Policy,
         gathered: crate::gather::Plan,
     ) -> Result<Plan> {
         let held = gathered.params();
@@ -80,30 +244,78 @@ impl Plan {
             .filter(|(at, _)| !held.contains(at))
             .map(|(_, plane)| plane.next_multiple_of(crate::weights::ALIGN))
             .sum();
-        let Some(budget) = budget else {
-            return Ok(Plan {
-                device_bytes: full,
-                gathered,
-                ..Plan::default()
-            });
+        let whole = |word: &str| Plan {
+            device_bytes: full,
+            gathered: gathered.clone(),
+            policy: word.to_string(),
+            ..Plan::default()
         };
-        if budget >= full {
-            return Ok(Plan {
-                device_bytes: full,
-                gathered,
-                ..Plan::default()
-            });
+        match policy {
+            Policy::Off => return Ok(whole("off: every expert resident")),
+            Policy::Budget(budget) if budget >= full => {
+                return Ok(whole("budget holds the plan whole"));
+            }
+            Policy::Budget(_) | Policy::Slots(_) | Policy::Auto { .. } => {}
         }
 
         let (mut bands, mut groups) = found(trace, planes, &bytes)?;
         if bands.is_empty() {
-            return Err(Fault::Residency(format!(
-                "`device_weight_budget` is {budget} bytes and this plan's weight table \
-                 demands {full}. Nothing in it is a routed-expert bank, so there is no \
-                 tier to hold less of: only routed experts stream (their seat is \
-                 chosen after the router has run); dense planes do not. Raise the budget, or state `None` for uncapped."
-            )));
+            return match policy {
+                Policy::Budget(budget) => Err(Fault::Residency(format!(
+                    "`device_weight_budget` is {budget} bytes and this plan's weight table \
+                     demands {full}. Nothing in it is a routed-expert bank, so there is no \
+                     tier to hold less of: only routed experts stream (their seat is \
+                     chosen after the router has run); dense planes do not. Raise the budget, or state `None` for uncapped."
+                ))),
+                _ => Ok(whole("no routed experts in this plan")),
+            };
         }
+
+        // The pool's regions: bands of one position and stride across every
+        // group alias one slab. The head is the lowest param of the region,
+        // so it is placed before any band that aliases it.
+        let mut regions: Vec<RegionPlan> = Vec::new();
+        for group in &groups {
+            for (position, &band) in group.bands.iter().enumerate() {
+                let stride = bands[band].stride;
+                let param = bands[band].param;
+                let at = match regions
+                    .iter()
+                    .position(|region| region.position == position && region.stride == stride)
+                {
+                    Some(at) => at,
+                    None => {
+                        regions.push(RegionPlan {
+                            position,
+                            stride,
+                            head: param,
+                            bands: Vec::new(),
+                        });
+                        regions.len() - 1
+                    }
+                };
+                regions[at].bands.push(band);
+                regions[at].head = regions[at].head.min(param);
+            }
+        }
+        let mut alias_of: BTreeMap<usize, usize> = BTreeMap::new();
+        for region in &regions {
+            for &band in &region.bands {
+                let param = bands[band].param;
+                if param != region.head {
+                    alias_of.insert(param, region.head);
+                }
+            }
+        }
+        let per_slot: u64 = regions.iter().map(|region| region.stride).sum();
+        let seats = |n: u32| -> u64 {
+            regions
+                .iter()
+                .map(|region| {
+                    (u64::from(n) * region.stride).next_multiple_of(crate::weights::ALIGN)
+                })
+                .sum()
+        };
 
         let streamed: BTreeSet<usize> = bands.iter().map(|band| band.param).collect();
         let dense: u64 = bytes
@@ -112,13 +324,6 @@ impl Plan {
             .filter(|(at, _)| !streamed.contains(at) && !held.contains(at))
             .map(|(_, plane)| plane.next_multiple_of(crate::weights::ALIGN))
             .sum();
-        let strides: Vec<u64> = bands.iter().map(|band| band.stride).collect();
-        let seats = |n: u32| -> u64 {
-            strides
-                .iter()
-                .map(|stride| (u64::from(n) * stride).next_multiple_of(crate::weights::ALIGN))
-                .sum()
-        };
         let fan = groups
             .iter()
             .filter_map(|group| fan_out(trace, group.routes))
@@ -128,29 +333,82 @@ impl Plan {
         let need = (1..=u32::MAX)
             .find(|&n| pass_group(n) >= fan)
             .unwrap_or(fan);
-        let floor = dense + seats(need);
-        if budget < floor {
-            return Err(Fault::Residency(format!(
-                "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
-                 demand {dense} resident and its {} routed bands need {need} expert \
-                 seats each on top (a row routes to {fan} experts and a pass seats half \
-                 the slab), which is {floor}. Dense planes do not stream in this build, \
-                 so the budget cannot be met by holding less. Raise it to at least \
-                 {floor}, or state `None`.",
-                bands.len(),
-            )));
-        }
-
-        let experts = groups[0].experts;
-        let slack = budget - dense;
-        let mut slots = 0u32;
-        for n in (need..=experts.max(need)).rev() {
-            if seats(n) <= slack {
-                slots = n;
-                break;
+        let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
+        let ceiling = u32::try_from(pairs).unwrap_or(u32::MAX).max(need);
+        let largest = |usable: u64| -> u32 {
+            let mut n = u32::try_from(usable / seats(1).max(1))
+                .unwrap_or(u32::MAX)
+                .min(ceiling);
+            while n > need && seats(n) > usable {
+                n -= 1;
             }
-        }
-        debug_assert!(slots >= need, "the floor check above proved the seats fit");
+            n
+        };
+
+        let (slots, word) = match policy {
+            Policy::Off => return Ok(whole("off: every expert resident")),
+            Policy::Budget(budget) => {
+                let floor = dense + seats(need);
+                if budget < floor {
+                    return Err(Fault::Residency(format!(
+                        "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
+                         demand {dense} resident and its {} routed bands need {need} expert \
+                         seats in the shared pool on top (a row routes to {fan} experts and a \
+                         pass seats half the pool), which is {floor}. Dense planes do not \
+                         stream in this build, so the budget cannot be met by holding less. \
+                         Raise it to at least {floor}, or state `None`.",
+                        bands.len(),
+                    )));
+                }
+                let slots = largest(budget - dense);
+                (slots, format!("budget {:.2} GiB", gib(budget)))
+            }
+            Policy::Slots(n) => {
+                if n < need {
+                    return Err(Fault::Residency(format!(
+                        "`{CACHE_ENV}={n}` seats fewer experts than one row routes to: a \
+                         row reads {fan} experts and a pass seats half the pool, so the pool \
+                         needs at least {need} seats"
+                    )));
+                }
+                (n.min(ceiling), format!("{CACHE_ENV}={n}"))
+            }
+            Policy::Auto { headroom } => {
+                let free = free_ram().ok_or_else(|| {
+                    Fault::Residency(
+                        "the host's free memory could not be read, so the expert pool \
+                         cannot be sized from it; state `PIE_EXPERT_CACHE=<seats>` or a \
+                         `device_weight_budget`"
+                            .to_string(),
+                    )
+                })?;
+                let usable = free.saturating_sub(headroom).saturating_sub(dense);
+                let slots = largest(usable);
+                if seats(slots) > usable || slots < need {
+                    return Err(Fault::Residency(format!(
+                        "free RAM is {:.2} GiB; less the {:.2} GiB headroom and the {:.2} \
+                         GiB of dense planes, {:.2} GiB is left, and the pool needs at least \
+                         {need} seats of {:.2} MiB. Lower `{HEADROOM_ENV}`, or state \
+                         `{CACHE_ENV}=<seats>` to size the pool by hand.",
+                        gib(free),
+                        gib(headroom),
+                        gib(dense),
+                        gib(usable),
+                        per_slot as f64 / (1u64 << 20) as f64,
+                    )));
+                }
+                (
+                    slots,
+                    format!(
+                        "auto: free {:.2} GiB - headroom {:.2} GiB - dense {:.2} GiB",
+                        gib(free),
+                        gib(headroom),
+                        gib(dense)
+                    ),
+                )
+            }
+        };
+        debug_assert!(slots >= need, "every arm above proved the floor");
 
         for band in &mut bands {
             band.slots = slots;
@@ -169,9 +427,14 @@ impl Plan {
             device_bytes: dense + seats(slots),
             bands,
             groups,
+            regions,
+            alias_of,
             resident_of,
             host_of,
             slots,
+            per_slot,
+            pairs,
+            policy: word,
             host_bytes,
             gathered,
         })
@@ -198,8 +461,33 @@ impl Plan {
     }
 
     #[must_use]
+    pub fn regions(&self) -> &[RegionPlan] {
+        &self.regions
+    }
+
+    /// Seats in the shared pool.
+    #[must_use]
     pub fn slots(&self) -> u32 {
         self.slots
+    }
+
+    /// Bytes one seat holds across every region: one expert of every band.
+    #[must_use]
+    pub fn per_slot_bytes(&self) -> u64 {
+        self.per_slot
+    }
+
+    /// `(layer, expert)` pairs the pool can be asked for.
+    #[must_use]
+    pub fn pairs(&self) -> u64 {
+        self.pairs
+    }
+
+    /// The param whose reservation this streamed param aliases, if it is not
+    /// its region's head.
+    #[must_use]
+    pub fn alias(&self, param: usize) -> Option<usize> {
+        self.alias_of.get(&param).copied()
     }
 
     #[must_use]
@@ -226,6 +514,24 @@ impl Plan {
     #[must_use]
     pub fn source_bytes(&self) -> u64 {
         self.host_bytes
+    }
+
+    /// One line for the load log.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if !self.streams() {
+            return format!("expert cache off ({})", self.policy);
+        }
+        format!(
+            "expert cache: {} seats x {:.2} MiB = {:.2} GiB shared by {} groups over {} \
+             (layer, expert) pairs [{}]",
+            self.slots,
+            self.per_slot as f64 / (1u64 << 20) as f64,
+            gib(u64::from(self.slots) * self.per_slot),
+            self.groups.len(),
+            self.pairs,
+            self.policy,
+        )
     }
 }
 
@@ -487,15 +793,34 @@ struct Band {
     stride: u64,
 }
 
+/// One router's mixture: its bands and where each of its experts sits in
+/// the shared pool, if anywhere.
 #[derive(Debug)]
-struct Slab {
+struct Group {
     experts: u32,
-    slots: u32,
     bands: Vec<Band>,
     seat_of: Vec<Option<u32>>,
-    in_seat: Vec<Option<u32>>,
+    ever: Vec<bool>,
+}
+
+/// The shared LRU pool: one seat holds one `(group, expert)` of any group.
+#[derive(Debug)]
+struct Pool {
+    slots: u32,
+    in_seat: Vec<Option<(u32, u32)>>,
     pinned: Vec<bool>,
     last_used: Vec<u64>,
+}
+
+impl Pool {
+    fn new(slots: u32) -> Pool {
+        Pool {
+            slots,
+            in_seat: vec![None; slots as usize],
+            pinned: vec![false; slots as usize],
+            last_used: vec![0; slots as usize],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,11 +918,14 @@ impl Source {
     }
 }
 
+type Job = (u64, u64, u64);
+
 #[derive(Debug)]
 pub struct Tier {
     store: Store,
     source: Source,
-    slabs: Vec<Slab>,
+    groups: Vec<Group>,
+    pool: Pool,
     of_routes: BTreeMap<u32, usize>,
     swaps: u64,
     segments: u64,
@@ -606,6 +934,11 @@ pub struct Tier {
     tick: u64,
     hits: u64,
     misses: u64,
+    bytes_read: u64,
+    distinct: u64,
+    per_slot: u64,
+    pairs: u64,
+    policy: String,
     cut_ns: u64,
     copy_ns: u64,
     wait_ns: u64,
@@ -629,6 +962,114 @@ pub struct Prediction {
     pub prefetched: u64,
 }
 
+/// The pool's tally, for the log and the shutdown line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheReport {
+    pub policy: String,
+    pub slots: u32,
+    pub pairs: u64,
+    pub per_slot: u64,
+    pub resident: u64,
+    pub distinct: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes_read: u64,
+    pub segments: u64,
+    pub copy_ns: u64,
+    pub wait_ns: u64,
+}
+
+impl std::fmt::Display for CacheReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let looked = self.hits + self.misses;
+        let rate = if looked == 0 {
+            0.0
+        } else {
+            self.hits as f64 * 100.0 / looked as f64
+        };
+        write!(
+            f,
+            "expert-cache: {} seats x {:.2} MiB ({:.2} GiB) over {} (layer, expert) pairs \
+             [{}]; {} resident, {} distinct ever seated; {} hits / {} misses ({rate:.1}% hit) \
+             across {} segments; {:.3} GiB read from disk ({:.1} ms copying, {:.1} ms waiting \
+             on the device)",
+            self.slots,
+            self.per_slot as f64 / (1u64 << 20) as f64,
+            gib(u64::from(self.slots) * self.per_slot),
+            self.pairs,
+            self.policy,
+            self.resident,
+            self.distinct,
+            self.hits,
+            self.misses,
+            self.segments,
+            gib(self.bytes_read),
+            self.copy_ns as f64 / 1e6,
+            self.wait_ns as f64 / 1e6,
+        )
+    }
+}
+
+/// One fire's slice of the tally, appended to `PIE_EXPERT_CACHE_LOG` as CSV.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct FireRecord {
+    pub rows: u32,
+    pub cuts: u64,
+    pub copies: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub bytes_read: u64,
+    pub cut_ms: f64,
+    pub copy_ms: f64,
+    pub wait_ms: f64,
+    pub walk_ms: f64,
+}
+
+type FireLog = std::sync::Mutex<(u64, std::io::BufWriter<std::fs::File>)>;
+
+fn fire_log() -> Option<&'static FireLog> {
+    static LOG: std::sync::OnceLock<Option<FireLog>> = std::sync::OnceLock::new();
+    LOG.get_or_init(|| {
+        use std::io::Write;
+        let path = std::env::var_os(LOG_ENV)?;
+        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).ok()?);
+        let _ = writeln!(
+            file,
+            "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms"
+        );
+        let _ = file.flush();
+        Some(std::sync::Mutex::new((0, file)))
+    })
+    .as_ref()
+}
+
+pub fn log_fire(record: &FireRecord) {
+    use std::io::Write;
+    let Some(log) = fire_log() else {
+        return;
+    };
+    let mut log = log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (seq, file) = &mut *log;
+    let _ = writeln!(
+        file,
+        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
+        record.rows,
+        record.cuts,
+        record.copies,
+        record.hits,
+        record.misses,
+        record.bytes_read,
+        record.cut_ms,
+        record.copy_ms,
+        record.wait_ms,
+        record.walk_ms,
+    );
+    let _ = file.flush();
+    *seq += 1;
+}
+
 const PREFETCH_K: usize = 4;
 
 pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
@@ -640,13 +1081,19 @@ impl Tier {
         let mut tier = Tier {
             store: store.clone(),
             source,
-            slabs: Vec::with_capacity(plan.groups.len()),
+            groups: Vec::with_capacity(plan.groups.len()),
+            pool: Pool::new(plan.slots),
             of_routes: BTreeMap::new(),
             swaps: 0,
             segments: 0,
             tick: 1,
             hits: 0,
             misses: 0,
+            bytes_read: 0,
+            distinct: 0,
+            per_slot: plan.per_slot,
+            pairs: plan.pairs,
+            policy: plan.policy.clone(),
             cut_ns: 0,
             copy_ns: 0,
             wait_ns: 0,
@@ -693,30 +1140,38 @@ impl Tier {
                 })
                 .collect::<Result<Vec<Band>>>()?;
             tier.of_routes.insert(group.routes.0, at);
-            tier.slabs.push(Slab {
+            tier.groups.push(Group {
                 experts: group.experts,
-                slots: group.slots,
                 bands,
                 seat_of: vec![None; group.experts as usize],
-                in_seat: vec![None; group.slots as usize],
-                pinned: vec![false; group.slots as usize],
-                last_used: vec![0; group.slots as usize],
+                ever: vec![false; group.experts as usize],
             });
         }
-        for at in 0..tier.slabs.len() {
-            for seat in 0..tier.slabs[at].slots {
-                tier.slabs[at].in_seat[seat as usize] = Some(seat);
-                tier.slabs[at].seat_of[seat as usize] = Some(seat);
-                tier.pending.push((at, seat, seat));
-            }
-        }
-        tier.flush()?;
+        // Every seat starts empty: an expert is read from disk the first time
+        // a router names it, and not before.
         tier.file = tier
             .source
             .file()
             .and_then(|file| file.try_clone().ok())
             .map(std::sync::Arc::new);
-        tier.swaps = 0;
+        if let (Some(file), Bytes::Artifact(_)) = (&tier.file, &tier.source.bytes)
+            && nocache()
+        {
+            // The seats ARE the copy the engine reads; a second copy of every
+            // expert in the page cache would only crowd out the pool. Reads
+            // through this descriptor go SSD -> seat.
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::fd::AsRawFd;
+                // SAFETY: fcntl on a live descriptor with an integer argument.
+                let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) };
+                if rc != 0 {
+                    eprintln!(
+                        "engine-metal: F_NOCACHE on the artifact was refused; expert reads go through the page cache"
+                    );
+                }
+            }
+        }
         tier.source.settle();
         Ok(tier)
     }
@@ -794,10 +1249,10 @@ impl Tier {
                         continue;
                     }
                     let expert = id as u32;
-                    if expert >= self.slabs[at].experts {
+                    if expert >= self.groups[at].experts {
                         continue;
                     }
-                    let seated = self.slabs[at].seat_of[expert as usize].is_some();
+                    let seated = self.groups[at].seat_of[expert as usize].is_some();
                     self.prediction.total += 1;
                     if !seated {
                         self.prediction.misses += 1;
@@ -864,7 +1319,10 @@ impl Tier {
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
-        self.slabs[at].pinned.fill(false);
+        // The cut that brought us here waited for the previous segment's
+        // matmuls, so nothing on the device reads a seat any more: every pin
+        // is released and this segment pins only what it reads.
+        self.pool.pinned.fill(false);
         self.segments += 1;
         if span.rows == 0 {
             return Ok(());
@@ -902,13 +1360,13 @@ impl Tier {
                 continue;
             }
             let expert = id as u32;
-            if expert >= self.slabs[at].experts {
+            if expert >= self.groups[at].experts {
                 return Err(Fault::Residency(format!(
                     "a routing vector names expert {expert} and `{}` declares {} of them; \
                      a seat cannot be found for an expert the router does not have. This \
                      is a routing vector read at the wrong instant — the segment cut ran \
                      against bytes some other segment wrote.",
-                    self.slabs[at].bands[0].name, self.slabs[at].experts
+                    self.groups[at].bands[0].name, self.groups[at].experts
                 )));
             }
             let seat = self.seat(at, expert)?;
@@ -935,7 +1393,7 @@ impl Tier {
         span: MaskSpan,
         (pass, passes): (u32, u32),
     ) -> Result<u32> {
-        self.slabs[at].pinned.fill(false);
+        self.pool.pinned.fill(false);
         self.segments += 1;
         if span.rows == 0 {
             return Ok(0);
@@ -979,24 +1437,24 @@ impl Tier {
                     continue;
                 }
                 let expert = id as u32;
-                if expert >= self.slabs[at].experts {
+                if expert >= self.groups[at].experts {
                     return Err(Fault::Residency(format!(
                         "a routing vector names expert {expert} and `{}` declares {} of them; \
                          a seat cannot be found for an expert the router does not have.",
-                        self.slabs[at].bands[0].name, self.slabs[at].experts
+                        self.groups[at].bands[0].name, self.groups[at].experts
                     )));
                 }
                 if !order.contains(&expert) {
                     order.push(expert);
                 }
             }
-            let seat_of = &self.slabs[at].seat_of;
+            let seat_of = &self.groups[at].seat_of;
             let (mut leading, trailing): (Vec<u32>, Vec<u32>) = order
                 .into_iter()
                 .partition(|&e| seat_of[e as usize].is_some());
             leading.extend(trailing);
             let order = leading;
-            let seats = pass_group(self.slabs[at].slots) as usize;
+            let seats = pass_group(self.pool.slots) as usize;
             let groups = order.chunks(seats).map(<[u32]>::to_vec).collect();
             self.passing[at] = Some(Passing {
                 row_offset: span.row_offset,
@@ -1035,7 +1493,7 @@ impl Tier {
         if crate::diag::on().cut_trace {
             let seats: Vec<i32> = seat_of.values().copied().collect();
             eprintln!(
-                "pass {pass} of {passes} on slab {at}: group of {} experts (seats {:?}), {assigned} of {count} entries assigned, groups {}",
+                "pass {pass} of {passes} on group {at}: group of {} experts (seats {:?}), {assigned} of {count} entries assigned, groups {}",
                 group.len(),
                 seats,
                 self.passing[at].as_ref().map_or(0, |p| p.groups.len())
@@ -1053,40 +1511,26 @@ impl Tier {
             .map_or(0, |p| p.groups.len() as u32))
     }
 
-    fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
+    /// The copy jobs that land `expert` of group `at` in `seat`: one per band.
+    fn jobs(&self, at: usize, seat: u32, expert: u32, into: &mut Vec<Job>) {
+        for band in &self.groups[at].bands {
+            into.push((
+                band.at + u64::from(seat) * band.stride,
+                band.from + u64::from(expert) * band.stride,
+                band.stride,
+            ));
+        }
+    }
+
+    fn spawn(&mut self, jobs: Vec<Job>) -> Result<()> {
         let Some(file) = self.file.clone() else {
             return Ok(());
         };
-        let mut jobs: Vec<(u64, u64, u64)> = Vec::new();
-        for &expert in experts {
-            if self.slabs[at].seat_of[expert as usize].is_some() {
-                continue;
-            }
-            let Ok(seat) = self.evict(at) else {
-                break;
-            };
-            if let Some(held) = self.slabs[at].in_seat[seat as usize] {
-                self.slabs[at].seat_of[held as usize] = None;
-            }
-            let slab = &mut self.slabs[at];
-            slab.in_seat[seat as usize] = Some(expert);
-            slab.seat_of[expert as usize] = Some(seat);
-            slab.last_used[seat as usize] = self.tick;
-            self.tick += 1;
-            slab.pinned[seat as usize] = true;
-            for band in &slab.bands {
-                jobs.push((
-                    band.at + u64::from(seat) * band.stride,
-                    band.from + u64::from(expert) * band.stride,
-                    band.stride,
-                ));
-            }
-            self.prediction.prefetched += 1;
-        }
         if jobs.is_empty() {
             return Ok(());
         }
         self.swaps += jobs.len() as u64;
+        self.bytes_read += jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
         let writers = self.store.file_writers(&jobs)?;
         let threads = self.threads;
         self.inflight = Some(std::thread::spawn(move || {
@@ -1096,6 +1540,54 @@ impl Tier {
             Ok(())
         }));
         Ok(())
+    }
+
+    fn prefetch(&mut self, at: usize, rows: &[Vec<u32>]) -> Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        // Pins stay: the segment that just ran pinned the seats the device is
+        // about to read, and a prefetch may only evict around them.
+        let mut wanted: Vec<u32> = Vec::new();
+        for row in rows {
+            for &expert in row.iter().take(self.prefetch_k) {
+                if expert < self.groups[at].experts && !wanted.contains(&expert) {
+                    wanted.push(expert);
+                }
+            }
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        for expert in wanted {
+            if let Some(seat) = self.groups[at].seat_of[expert as usize] {
+                self.pool.last_used[seat as usize] = self.tick;
+                self.tick += 1;
+                continue;
+            }
+            let Ok(seat) = self.place(at, expert) else {
+                break;
+            };
+            self.jobs(at, seat, expert, &mut jobs);
+            self.prediction.prefetched += 1;
+        }
+        self.spawn(jobs)
+    }
+
+    fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
+        if self.file.is_none() {
+            return Ok(());
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        for &expert in experts {
+            if self.groups[at].seat_of[expert as usize].is_some() {
+                continue;
+            }
+            let Ok(seat) = self.place(at, expert) else {
+                break;
+            };
+            self.jobs(at, seat, expert, &mut jobs);
+            self.prediction.prefetched += 1;
+        }
+        self.spawn(jobs)
     }
 
     fn join_inflight(&mut self) -> Result<()> {
@@ -1109,84 +1601,39 @@ impl Tier {
         }
     }
 
-    fn prefetch(&mut self, at: usize, rows: &[Vec<u32>]) -> Result<()> {
-        let Some(file) = self.file.clone() else {
-            return Ok(());
-        };
-        self.slabs[at].pinned.fill(false);
-        let mut wanted: Vec<u32> = Vec::new();
-        for row in rows {
-            for &expert in row.iter().take(self.prefetch_k) {
-                if expert < self.slabs[at].experts && !wanted.contains(&expert) {
-                    wanted.push(expert);
-                }
-            }
+    fn touch(&mut self, seat: u32) {
+        self.pool.last_used[seat as usize] = self.tick;
+        self.tick += 1;
+        self.pool.pinned[seat as usize] = true;
+    }
+
+    /// Give `expert` of group `at` a seat, evicting whoever held it. The
+    /// caller issues the copy.
+    fn place(&mut self, at: usize, expert: u32) -> Result<u32> {
+        let seat = self.evict(at)?;
+        if let Some((group, held)) = self.pool.in_seat[seat as usize].take() {
+            self.groups[group as usize].seat_of[held as usize] = None;
         }
-        let mut jobs: Vec<(u64, u64, u64)> = Vec::new();
-        for expert in wanted {
-            if let Some(seat) = self.slabs[at].seat_of[expert as usize] {
-                self.slabs[at].last_used[seat as usize] = self.tick;
-                self.tick += 1;
-                continue;
-            }
-            let Ok(seat) = self.evict(at) else {
-                break;
-            };
-            if let Some(held) = self.slabs[at].in_seat[seat as usize] {
-                self.slabs[at].seat_of[held as usize] = None;
-            }
-            let slab = &mut self.slabs[at];
-            slab.in_seat[seat as usize] = Some(expert);
-            slab.seat_of[expert as usize] = Some(seat);
-            slab.last_used[seat as usize] = self.tick;
-            self.tick += 1;
-            slab.pinned[seat as usize] = true;
-            for band in &slab.bands {
-                jobs.push((
-                    band.at + u64::from(seat) * band.stride,
-                    band.from + u64::from(expert) * band.stride,
-                    band.stride,
-                ));
-            }
-            self.prediction.prefetched += 1;
+        self.pool.in_seat[seat as usize] = Some((at as u32, expert));
+        self.groups[at].seat_of[expert as usize] = Some(seat);
+        if !self.groups[at].ever[expert as usize] {
+            self.groups[at].ever[expert as usize] = true;
+            self.distinct += 1;
         }
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        self.swaps += jobs.len() as u64;
-        let writers = self.store.file_writers(&jobs)?;
-        let threads = self.threads;
-        self.inflight = Some(std::thread::spawn(move || {
-            for (writer, jobs) in &writers {
-                writer.pread(&file, jobs, threads)?;
-            }
-            Ok(())
-        }));
-        Ok(())
+        self.touch(seat);
+        Ok(seat)
     }
 
     fn seat(&mut self, at: usize, expert: u32) -> Result<u32> {
-        if let Some(seat) = self.slabs[at].seat_of[expert as usize] {
-            let slab = &mut self.slabs[at];
-            if !slab.pinned[seat as usize] {
+        if let Some(seat) = self.groups[at].seat_of[expert as usize] {
+            if !self.pool.pinned[seat as usize] {
                 self.hits += 1;
             }
-            slab.last_used[seat as usize] = self.tick;
-            self.tick += 1;
-            slab.pinned[seat as usize] = true;
+            self.touch(seat);
             return Ok(seat);
         }
         self.misses += 1;
-        let seat = self.evict(at)?;
-        if let Some(held) = self.slabs[at].in_seat[seat as usize] {
-            self.slabs[at].seat_of[held as usize] = None;
-        }
-        let slab = &mut self.slabs[at];
-        slab.in_seat[seat as usize] = Some(expert);
-        slab.seat_of[expert as usize] = Some(seat);
-        slab.last_used[seat as usize] = self.tick;
-        self.tick += 1;
-        slab.pinned[seat as usize] = true;
+        let seat = self.place(at, expert)?;
         self.pending.push((at, seat, expert));
         Ok(seat)
     }
@@ -1197,15 +1644,9 @@ impl Tier {
         }
         let started = std::time::Instant::now();
         let pending = std::mem::take(&mut self.pending);
-        let mut jobs: Vec<(u64, u64, u64)> = Vec::with_capacity(pending.len() * 3);
+        let mut jobs: Vec<Job> = Vec::with_capacity(pending.len() * 3);
         for &(at, seat, expert) in &pending {
-            for band in &self.slabs[at].bands {
-                jobs.push((
-                    band.at + u64::from(seat) * band.stride,
-                    band.from + u64::from(expert) * band.stride,
-                    band.stride,
-                ));
-            }
+            self.jobs(at, seat, expert, &mut jobs);
         }
         match self.source.file() {
             Some(file) => self.store.write_from_file(file, &jobs, self.threads)?,
@@ -1223,39 +1664,74 @@ impl Tier {
             }
         }
         self.swaps += jobs.len() as u64;
+        self.bytes_read += jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
         self.copy_ns += started.elapsed().as_nanos() as u64;
         Ok(())
     }
 
+    /// The least recently used seat no one has pinned this segment.
     fn evict(&mut self, at: usize) -> Result<u32> {
-        let slab = &self.slabs[at];
-        let victim = (0..slab.slots)
-            .filter(|&seat| !slab.pinned[seat as usize])
-            .min_by_key(|&seat| slab.last_used[seat as usize]);
+        let pool = &self.pool;
+        let victim = (0..pool.slots)
+            .filter(|&seat| !pool.pinned[seat as usize])
+            .min_by_key(|&seat| pool.last_used[seat as usize]);
         victim.ok_or_else(|| {
             Fault::Residency(format!(
                 "one segment of this fire routes to more than {} distinct experts of \
-                 `{}`, and the wired slab seats {}: every seat is pinned by a matmul \
+                 `{}`, and the shared pool seats {}: every seat is pinned by a matmul \
                  this same segment will run, so no seat can be reused. Every expert one \
-                 segment reads must be resident at once — raise `device_weight_budget`, or \
-                 fire fewer tokens per step. Splitting one segment's tokens into sub-batches \
-                 is the mechanism that would make this neither, and it is not in this build.",
-                slab.slots, slab.bands[0].name, slab.slots
+                 segment reads must be resident at once — raise `{CACHE_ENV}` or \
+                 `device_weight_budget`, or fire fewer tokens per step.",
+                pool.slots, self.groups[at].bands[0].name, pool.slots
             ))
         })
     }
 
     #[must_use]
     pub fn residency(&self) -> Vec<GroupResidency> {
-        self.slabs
+        self.groups
             .iter()
-            .map(|slab| GroupResidency {
-                name: slab.bands[0].name.clone(),
-                experts: slab.experts,
-                slots: slab.slots,
-                in_seat: slab.in_seat.clone(),
+            .enumerate()
+            .map(|(at, group)| {
+                let mut in_seat = vec![None; self.pool.slots as usize];
+                for (seat, held) in self.pool.in_seat.iter().enumerate() {
+                    if let Some((of, expert)) = *held
+                        && of as usize == at
+                    {
+                        in_seat[seat] = Some(expert);
+                    }
+                }
+                GroupResidency {
+                    name: group.bands[0].name.clone(),
+                    experts: group.experts,
+                    slots: self.pool.slots,
+                    in_seat,
+                }
             })
             .collect()
+    }
+
+    #[must_use]
+    pub fn report(&self) -> CacheReport {
+        CacheReport {
+            policy: self.policy.clone(),
+            slots: self.pool.slots,
+            pairs: self.pairs,
+            per_slot: self.per_slot,
+            resident: self
+                .pool
+                .in_seat
+                .iter()
+                .filter(|held| held.is_some())
+                .count() as u64,
+            distinct: self.distinct,
+            hits: self.hits,
+            misses: self.misses,
+            bytes_read: self.bytes_read,
+            segments: self.segments,
+            copy_ns: self.copy_ns,
+            wait_ns: self.wait_ns,
+        }
     }
 
     #[must_use]
@@ -1266,6 +1742,11 @@ impl Tier {
     #[must_use]
     pub fn hits(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
     }
 
     #[must_use]
@@ -1296,5 +1777,30 @@ impl Tier {
 impl Drop for Tier {
     fn drop(&mut self) {
         let _ = self.join_inflight();
+        if self.segments > 0 {
+            eprintln!("{}", self.report());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_parse() {
+        assert_eq!(parse_bytes("4GiB"), Some(4 << 30));
+        assert_eq!(parse_bytes("4G"), Some(4 << 30));
+        assert_eq!(parse_bytes(" 512 MiB "), Some(512 << 20));
+        assert_eq!(parse_bytes("1024"), Some(1024));
+        assert_eq!(parse_bytes("1.5GiB"), Some(3 << 29));
+        assert_eq!(parse_bytes("lots"), None);
+    }
+
+    #[test]
+    fn free_ram_reads_on_apple() {
+        if cfg!(target_vendor = "apple") {
+            assert!(free_ram().is_some_and(|bytes| bytes > 0));
+        }
     }
 }

@@ -190,6 +190,24 @@ pub fn ceiling(device: u64) -> u64 {
 }
 
 pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Vec<Cut>> {
+    cut_with(map, ceiling, bound, true)
+}
+
+/// Windows hugging the bound planes only, even when the whole file would fit
+/// one buffer. A streamed load reads its expert bands by `pread` into the
+/// pool; binding the file whole would have the device hold those bands
+/// resident a second time, and at pool sizes near the working set that is
+/// the difference between serving and thrashing.
+pub fn cut_around(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Vec<Cut>> {
+    cut_with(map, ceiling, bound, false)
+}
+
+fn cut_with(
+    map: &Mapping,
+    ceiling: u64,
+    bound: &[(&str, u64, u64)],
+    whole: bool,
+) -> Result<Vec<Cut>> {
     let page = page();
     let what = || map.path().display().to_string();
     let refuse = |why: String| Fault::Mapped {
@@ -205,7 +223,7 @@ pub fn cut(map: &Mapping, ceiling: u64, bound: &[(&str, u64, u64)]) -> Result<Ve
     }
     let span = map.span();
     let len = map.len();
-    if span <= ceiling {
+    if span <= ceiling && (whole || bound.is_empty()) {
         return Ok(vec![Cut::whole(map)]);
     }
     if bound.is_empty() {

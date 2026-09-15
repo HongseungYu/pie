@@ -523,7 +523,14 @@ impl Shell {
                 Some(boot.residency.device_demand()),
                 crate::store::accounting::DEFAULT_GPU_MEM_UTILIZATION,
             )?;
-            let source = boot.residency.source_bytes();
+            // Seat copies that bypass the page cache (`F_NOCACHE`, the
+            // default) read SSD -> seat and hold no second copy in RAM, so
+            // the squeeze below has nothing to squeeze.
+            let source = if crate::experts::nocache() {
+                0
+            } else {
+                boot.residency.source_bytes()
+            };
             let ram = Context::physical_memory();
             let wired = acct.weights + acct.scratch + acct.minimum + acct.floor;
             if source > 0 && ram > 0 && wired + source > ram - ram / 6 {
@@ -1415,6 +1422,20 @@ impl Shell {
         self.weights
             .tier()
             .map_or((0, 0), |tier| tier.borrow().hits())
+    }
+
+    /// Bytes the expert pool has read from disk so far.
+    #[must_use]
+    pub fn expert_bytes(&self) -> u64 {
+        self.weights
+            .tier()
+            .map_or(0, |tier| tier.borrow().bytes_read())
+    }
+
+    /// The expert pool's running tally, if one is open.
+    #[must_use]
+    pub fn expert_cache_report(&self) -> Option<crate::experts::CacheReport> {
+        self.weights.tier().map(|tier| tier.borrow().report())
     }
 
     #[must_use]
@@ -4088,33 +4109,57 @@ impl engine::frame::Shell for Shell {
         fire_trace(|| "encode-begin".to_string());
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let trace = crate::diag::on().tier_trace;
-            let before = trace.then(|| {
+            let before = self.weights.tier().is_some().then(|| {
                 (
                     self.expert_motion(),
                     self.expert_hits(),
+                    self.expert_bytes(),
                     self.expert_host_time(),
                     std::time::Instant::now(),
                 )
             });
             let walked = self.walk_streamed(&prepared)?;
-            if let Some(((swaps0, cuts0), (hits0, misses0), (cut0, copy0, wait0), started)) = before
+            if let Some((
+                (swaps0, cuts0),
+                (hits0, misses0),
+                bytes0,
+                (cut0, copy0, wait0),
+                started,
+            )) = before
             {
                 let (swaps, cuts) = self.expert_motion();
                 let (hits, misses) = self.expert_hits();
                 let (cut_ns, copy_ns, wait_ns) = self.expert_host_time();
-                eprintln!(
-                    "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} misses; \
-                     cuts {:.1} ms (copies {:.1} ms, waiting on the device {:.1} ms); walk {:.1} ms",
-                    prepared.descriptor.rows,
-                    swaps - swaps0,
-                    cuts - cuts0,
-                    hits - hits0,
-                    misses - misses0,
-                    (cut_ns - cut0) as f64 / 1e6,
-                    (copy_ns - copy0) as f64 / 1e6,
-                    (wait_ns - wait0) as f64 / 1e6,
-                    started.elapsed().as_secs_f64() * 1e3
-                );
+                let record = crate::experts::FireRecord {
+                    rows: prepared.descriptor.rows,
+                    cuts: cuts - cuts0,
+                    copies: swaps - swaps0,
+                    hits: hits - hits0,
+                    misses: misses - misses0,
+                    bytes_read: self.expert_bytes() - bytes0,
+                    cut_ms: (cut_ns - cut0) as f64 / 1e6,
+                    copy_ms: (copy_ns - copy0) as f64 / 1e6,
+                    wait_ms: (wait_ns - wait0) as f64 / 1e6,
+                    walk_ms: started.elapsed().as_secs_f64() * 1e3,
+                };
+                crate::experts::log_fire(&record);
+                if trace {
+                    eprintln!(
+                        "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} \
+                         misses, {:.1} MiB read; cuts {:.1} ms (copies {:.1} ms, waiting on \
+                         the device {:.1} ms); walk {:.1} ms",
+                        record.rows,
+                        record.copies,
+                        record.cuts,
+                        record.hits,
+                        record.misses,
+                        record.bytes_read as f64 / (1u64 << 20) as f64,
+                        record.cut_ms,
+                        record.copy_ms,
+                        record.wait_ms,
+                        record.walk_ms,
+                    );
+                }
             }
             walked
         } else {

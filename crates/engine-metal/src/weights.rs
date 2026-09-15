@@ -163,7 +163,11 @@ impl Weights {
             }
         }
 
-        let spans: Vec<(u64, u64)> = places.iter().map(|p| (p.offset, p.reserved)).collect();
+        let spans: Vec<(u64, u64)> = places
+            .iter()
+            .filter(|p| !p.alias)
+            .map(|p| (p.offset, p.reserved))
+            .collect();
         let mut store = Store::zeroed(device, &spans, device.max_buffer())?;
 
         let mut host = HostSource::open(plan.source_bytes())?;
@@ -651,6 +655,9 @@ struct Place {
     full: u64,
     streamed: bool,
     gathered: bool,
+    /// A band of the shared expert pool that reads its region head's
+    /// reservation rather than one of its own.
+    alias: bool,
     rows: u32,
     width: u32,
     dtype: Dtype,
@@ -811,8 +818,21 @@ fn warm(
             } else {
                 bands.insert(index, offset);
             }
-            seats.push(Seat::Store(store_bytes));
-            store_bytes += place.reserved;
+            let seat = match plan.alias(index).map(|head| seats.get(head)) {
+                Some(Some(Seat::Store(head))) => *head,
+                Some(_) => {
+                    return Err(Some(format!(
+                        "its band `{}` aliases a pool region whose head has no store seat",
+                        param.name
+                    )));
+                }
+                None => {
+                    let mine = store_bytes;
+                    store_bytes += place.reserved;
+                    mine
+                }
+            };
+            seats.push(Seat::Store(seat));
             continue;
         }
         covers.push((param.name.as_str(), offset, place.full));
@@ -877,8 +897,8 @@ fn warm(
         .iter()
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
-            Seat::Store(offset) => Some((offset, place.reserved)),
-            Seat::Artifact(_) => None,
+            Seat::Store(offset) if !place.alias => Some((offset, place.reserved)),
+            Seat::Store(_) | Seat::Artifact(_) => None,
         })
         .collect();
     debug_assert_eq!(
@@ -937,8 +957,13 @@ fn warm(
             )));
         }
     }
-    let cuts = mapping::cut(&map, mapping::ceiling(device.max_buffer()), &covers)
-        .map_err(|why| Some(why.to_string()))?;
+    let ceiling = mapping::ceiling(device.max_buffer());
+    let cuts = if plan.streams() {
+        mapping::cut_around(&map, ceiling, &covers)
+    } else {
+        mapping::cut(&map, ceiling, &covers)
+    }
+    .map_err(|why| Some(why.to_string()))?;
     let mut files = Vec::with_capacity(cuts.len());
     for cut in &cuts {
         files.push(
@@ -1079,7 +1104,7 @@ impl TensorSink for Residue<'_> {
 
 fn places(trace: &Trace, plan: &Plan, gather: &gather::Plan) -> Result<Vec<Place>> {
     let bytes = plane_bytes(trace)?;
-    let mut out = Vec::with_capacity(trace.params.len());
+    let mut out: Vec<Place> = Vec::with_capacity(trace.params.len());
     let mut at = 0u64;
     for (index, param) in trace.params.iter().enumerate() {
         let (rows, width) = rectangle(&param.shape);
@@ -1090,6 +1115,33 @@ fn places(trace: &Trace, plan: &Plan, gather: &gather::Plan) -> Result<Vec<Place
             Some(slots) if rows > 0 => (full / rows * u64::from(slots), u64::from(slots)),
             _ => (full, rows),
         };
+        if let Some(head) = plan.alias(index) {
+            // A band of the shared expert pool that is not its region's head:
+            // it reads the head's reservation, seat for seat, and reserves
+            // nothing of its own.
+            let base = out
+                .get(head)
+                .filter(|place| place.streamed && !place.gathered && place.bytes == reserve)
+                .map(|place| place.offset)
+                .ok_or_else(|| Fault::Param {
+                    name: param.name.clone(),
+                    why: "aliases a pool region whose head was not placed before it, or \
+                          was placed at another size",
+                })?;
+            out.push(Place {
+                offset: base,
+                bytes: reserve,
+                reserved: 0,
+                full,
+                streamed: true,
+                gathered: false,
+                alias: true,
+                rows: u32::try_from(rows).unwrap_or(u32::MAX),
+                width: u32::try_from(width).unwrap_or(u32::MAX),
+                dtype: param.dtype,
+            });
+            continue;
+        }
         out.push(Place {
             offset: at,
             bytes: reserve,
@@ -1097,6 +1149,7 @@ fn places(trace: &Trace, plan: &Plan, gather: &gather::Plan) -> Result<Vec<Place
             full,
             streamed: seated.is_some() || gathered.is_some(),
             gathered: gathered.is_some(),
+            alias: false,
             rows: u32::try_from(rows).unwrap_or(u32::MAX),
             width: u32::try_from(width).unwrap_or(u32::MAX),
             dtype: param.dtype,
