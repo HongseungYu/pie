@@ -233,6 +233,13 @@ impl<'a> Sink<'a> {
             tier.note_wait(waited.as_nanos() as u64);
             tier.note_gpu((gpu.max(0.0) * 1e9) as u64);
         }
+        // The device is idle until the next commit. If the last segment read
+        // from disk this one probably will too, and the wait is long enough
+        // that the clock falls: hold it up. If it did not, the gap is tens of
+        // microseconds and a heater kernel would only be in the way.
+        if cuts.tier.is_some_and(|tier| tier.borrow().blocking()) {
+            crate::device::heater::arm();
+        }
         if crate::diag::on().cut_trace {
             eprintln!("cut-wait: {:.1} ms", waited.as_secs_f64() * 1e3);
         }

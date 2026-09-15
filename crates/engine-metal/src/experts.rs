@@ -1156,6 +1156,7 @@ pub struct Tier {
     file: Option<std::sync::Arc<std::fs::File>>,
     prefetch: bool,
     prefetch_k: usize,
+    blocked: bool,
     dump: Option<std::io::BufWriter<std::fs::File>>,
     prediction: Prediction,
 }
@@ -1364,6 +1365,7 @@ impl Tier {
                 .map(std::io::BufWriter::new),
             prefetch_k: crate::diag::on().prefetch_k.unwrap_or(PREFETCH_K),
             threads: crate::diag::on().seat_threads.unwrap_or(SEAT_THREADS),
+            blocked: false,
             pending: Vec::new(),
         };
         for (at, group) in plan.groups.iter().enumerate() {
@@ -2069,6 +2071,7 @@ impl Tier {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.blocked = !self.pending.is_empty();
         if self.pending.is_empty() {
             return Ok(());
         }
@@ -2190,6 +2193,13 @@ impl Tier {
 
     pub fn note_wait(&mut self, ns: u64) {
         self.wait_ns += ns;
+    }
+
+    /// Whether the last segment read from disk, so the next cut's host phase
+    /// is likely to be long. The heater asks before it fires.
+    #[must_use]
+    pub fn blocking(&self) -> bool {
+        self.blocked
     }
 
     /// Device time of a cut frame, as the command buffer reports it.

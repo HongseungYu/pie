@@ -520,6 +520,9 @@ impl Shell {
         weights.decode_absorbed(&device, &handles, &boot.trace)?;
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         handles.seal();
+        if weights.tier().is_some() {
+            eprintln!("engine-metal: {}", crate::device::heater::start(&device));
+        }
 
         {
             let kv_pool = crate::store::pool_demand(&boot.trace, paging)?;
@@ -1617,6 +1620,15 @@ impl Shell {
             let (start, end) = flight.pending.gpu_span_us();
             self.gpu_tail_ns
                 .set(self.gpu_tail_ns.get() + end.saturating_sub(start) * 1000);
+        }
+        if self
+            .weights
+            .tier()
+            .is_some_and(|tier| tier.borrow().blocking())
+        {
+            // Between this fire's last frame and the next fire's first, the
+            // device idles: keep its clock up.
+            crate::device::heater::arm();
         }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();

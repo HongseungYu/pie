@@ -449,6 +449,7 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
+            super::heater::pause();
             self.buffer.commit();
             self.buffer.waitUntilCompleted();
             if let Some(error) = self.buffer.error() {
@@ -470,6 +471,7 @@ impl Frame {
         #[cfg(target_vendor = "apple")]
         {
             self.end_pass();
+            super::heater::pause();
             self.buffer.commit();
             self.buffer.waitUntilCompleted();
             if let Some(error) = self.buffer.error() {
@@ -517,6 +519,7 @@ impl Frame {
                         .addCompletedHandler(block2::RcBlock::as_ptr(&handler));
                 }
             }
+            super::heater::pause();
             self.buffer.commit();
             Ok(Pending {
                 buffer: self.buffer.clone(),
