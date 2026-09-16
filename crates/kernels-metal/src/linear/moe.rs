@@ -24,6 +24,11 @@ const QMM_BK: u32 = 32;
 
 const MOE_TILE_ROWS: [u32; 4] = [8, 16, 32, 64];
 
+/// The widest id space `route_sort` bins: its per-expert histogram lives in
+/// threadgroup memory (`kMaxExperts` in moe_route.metal) and every route id at
+/// or past it is dropped on the floor, so a wider space must not batch.
+const ROUTE_SORT_MAX_EXPERTS: u32 = 1024;
+
 const MOE_TILE_COLS: [u32; 3] = [16, 32, 64];
 
 #[must_use]
@@ -737,6 +742,14 @@ pub fn matmul_select_batched(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
     routed_bank(op, x, bank)?;
+    // `experts` bounds the ids `routes` carries. On a streamed fire that is
+    // the seat count (pool + ring), which can exceed what `route_sort` bins;
+    // an id it cannot bin is silently skipped, so the row never lands and its
+    // output is whatever the arena held. Fall back to the per-row kernel,
+    // which indexes the bank by the id directly, rather than lose rows.
+    if experts > ROUTE_SORT_MAX_EXPERTS {
+        return Ok(false);
+    }
     let pairs = y.rows;
     let mut tile = tile_rows(pairs, experts, tuning);
     if tile <= 1 {

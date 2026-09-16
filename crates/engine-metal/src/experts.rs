@@ -1315,6 +1315,15 @@ pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
 const SEAT_THREADS: usize = 16;
 
 impl Tier {
+    /// Every seat a routing vector may name on a streamed fire: the pool's
+    /// own plus the prefill ring's two halves. `pass_at` seats into the
+    /// pool and `ring_at` into the ring, and both rewrite the routes to
+    /// those seat numbers before the matmuls run.
+    #[must_use]
+    pub fn seat_space(&self) -> u32 {
+        self.pool.slots + self.ring.as_ref().map_or(0, |ring| 2 * ring.experts)
+    }
+
     pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
         let mut tier = Tier {
             store: store.clone(),

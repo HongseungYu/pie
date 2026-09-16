@@ -152,6 +152,12 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
+
+    /// The index space a routing vector names on this fire: 0 when routes
+    /// hold the router's expert ids, else the streamed tier's seat count
+    /// (pool + prefill ring), because `pass_at`/`ring_at` rewrite every
+    /// route to the SEAT an expert was landed in before the matmuls run.
+    seat_space: u32,
 }
 
 impl<'c> Run<'c> {
@@ -169,6 +175,7 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
+        seat_space: u32,
     ) -> Self {
         Self {
             ctx,
@@ -185,6 +192,17 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
+            seat_space,
+        }
+    }
+
+    /// The bound on the ids a routing vector carries: the router's expert
+    /// count on a resident fire, the seat count on a streamed one.
+    pub(crate) fn route_space(&self, routes: ValueId) -> u32 {
+        if self.seat_space > 0 {
+            self.seat_space
+        } else {
+            self.experts(routes)
         }
     }
 
