@@ -126,6 +126,7 @@ impl Tier {
         tables: u64,
     ) -> Result<Tier> {
         tally::open_log(plan.knobs.log.as_deref());
+        tally::open_cuts(plan.knobs.cut_log.as_deref());
         let mut tier = Tier {
             store: store.clone(),
             source,
@@ -380,7 +381,13 @@ impl Tier {
         };
         let started = std::time::Instant::now();
         let out = self.segment_at(at, arena, handles, routes, rect, hint, span);
-        self.tally.cut_ns += started.elapsed().as_nanos() as u64;
+        let cut = started.elapsed();
+        self.tally.cut_ns += cut.as_nanos() as u64;
+        tally::log_cut(
+            &self
+                .tally
+                .close_cut(at as u32, span.rows, cut.as_secs_f64() * 1e3),
+        );
         out
     }
 

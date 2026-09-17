@@ -42,6 +42,8 @@ pub const REPORT_ENV: &str = "PIE_EXPERT_CACHE_REPORT";
 
 pub const COLD_ENV: &str = "PIE_EXPERT_CACHE_COLD";
 
+pub const CUT_LOG_ENV: &str = "PIE_EXPERT_CACHE_CUT_LOG";
+
 /// A row routes to `top_k` of `experts`, so `rows` rows name about
 /// `experts * (1 - exp(-rows * top_k / experts))` distinct experts: the
 /// union passes 80% of the layer at `rows = 1.6 * experts / top_k`. Below
@@ -69,6 +71,9 @@ pub struct Knobs {
     pub(super) report_every: u64,
     /// `PIE_EXPERT_CACHE_LOG`: where the per-fire CSV lands.
     pub(super) log: Option<std::path::PathBuf>,
+    /// `PIE_EXPERT_CACHE_CUT_LOG`: where the per-cut CSV lands, one row a
+    /// layer a fire — what a layer's own misses cost.
+    pub(super) cut_log: Option<std::path::PathBuf>,
     /// `PIE_METAL_HEATER`: the clock heater's `(MiB, in flight)`.
     pub(super) heater: Option<(u64, usize)>,
     /// `PIE_EXPERT_CACHE_COLD`: every prefill starts from an empty pool, so
@@ -104,6 +109,7 @@ impl Knobs {
                 .and_then(|word| word.trim().parse::<u64>().ok())
                 .unwrap_or(DEFAULT_REPORT_EVERY),
             log: std::env::var_os(LOG_ENV).map(std::path::PathBuf::from),
+            cut_log: std::env::var_os(CUT_LOG_ENV).map(std::path::PathBuf::from),
             heater: crate::device::heater::wanted(),
             cold: matches!(
                 std::env::var(COLD_ENV).as_deref().map(str::trim),
@@ -122,6 +128,7 @@ impl Knobs {
             nocache: true,
             report_every: DEFAULT_REPORT_EVERY,
             log: None,
+            cut_log: None,
             heater: None,
             cold: false,
         }

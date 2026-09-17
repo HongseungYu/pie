@@ -104,6 +104,26 @@ pub struct FireRecord {
     pub t_ms: f64,
 }
 
+/// One cut's slice: a layer's own misses, and what they cost it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CutRecord {
+    pub fire: u64,
+    pub group: u32,
+    pub rows: u32,
+    pub misses: u64,
+    pub hits: u64,
+    pub copies: u64,
+    pub bytes_read: u64,
+    /// Host time this cut spent reading its misses.
+    pub copy_ms: f64,
+    /// Host time waiting on the device for the frame this cut closed.
+    pub wait_ms: f64,
+    /// Device time that frame reported.
+    pub gpu_ms: f64,
+    /// The whole cut, reading and seating together.
+    pub cut_ms: f64,
+}
+
 type FireLog = std::sync::Mutex<(u64, std::io::BufWriter<std::fs::File>)>;
 
 static LOG: std::sync::OnceLock<Option<FireLog>> = std::sync::OnceLock::new();
@@ -126,6 +146,50 @@ pub(super) fn open_log(path: Option<&std::path::Path>) {
 
 fn fire_log() -> Option<&'static FireLog> {
     LOG.get()?.as_ref()
+}
+
+type CutLog = std::sync::Mutex<std::io::BufWriter<std::fs::File>>;
+
+static CUTS: std::sync::OnceLock<Option<CutLog>> = std::sync::OnceLock::new();
+
+/// Open the per-cut CSV the load asked for (`PIE_EXPERT_CACHE_CUT_LOG`).
+pub(super) fn open_cuts(path: Option<&std::path::Path>) {
+    let _ = CUTS.get_or_init(|| {
+        use std::io::Write;
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path?).ok()?);
+        let _ = writeln!(
+            file,
+            "fire,group,rows,misses,hits,copies,bytes_read,copy_ms,wait_ms,gpu_ms,cut_ms"
+        );
+        let _ = file.flush();
+        Some(std::sync::Mutex::new(file))
+    });
+}
+
+pub(super) fn log_cut(record: &CutRecord) {
+    use std::io::Write;
+    let Some(log) = CUTS.get().and_then(Option::as_ref) else {
+        return;
+    };
+    let mut file = log
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = writeln!(
+        file,
+        "{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3}",
+        record.fire,
+        record.group,
+        record.rows,
+        record.misses,
+        record.hits,
+        record.copies,
+        record.bytes_read,
+        record.copy_ms,
+        record.wait_ms,
+        record.gpu_ms,
+        record.cut_ms,
+    );
+    let _ = file.flush();
 }
 
 pub fn log_fire(record: &FireRecord) {
@@ -196,6 +260,8 @@ pub(super) struct Tally {
     fires: u64,
     report_every: u64,
     at: Mark,
+    /// The counters as the cut before this one closed.
+    cut_at: Mark,
 }
 
 impl Tally {
@@ -257,6 +323,25 @@ impl Tally {
 
     pub(super) fn fires(&self) -> u64 {
         self.fires
+    }
+
+    /// One cut closes: its own slice of the counters since the cut before.
+    pub(super) fn close_cut(&mut self, group: u32, rows: u32, cut_ms: f64) -> CutRecord {
+        let at = self.cut_at;
+        self.cut_at = self.mark();
+        CutRecord {
+            fire: self.fires,
+            group,
+            rows,
+            misses: self.misses - at.misses,
+            hits: self.hits - at.hits,
+            copies: self.swaps - at.swaps,
+            bytes_read: self.bytes_read - at.bytes_read,
+            copy_ms: (self.copy_ns - at.copy_ns) as f64 / 1e6,
+            wait_ms: (self.wait_ns - at.wait_ns) as f64 / 1e6,
+            gpu_ms: (self.gpu_ns - at.gpu_ns) as f64 / 1e6,
+            cut_ms,
+        }
     }
 
     /// Whether this fire is one the pool says a word about.
