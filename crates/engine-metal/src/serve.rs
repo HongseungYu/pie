@@ -302,11 +302,6 @@ pub struct Shell {
     cuts: Vec<Option<ValueId>>,
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
-    expert_fires: std::cell::Cell<u64>,
-    /// Fires between two `expert-cache:` lines on stderr, off the plan.
-    expert_report_every: u64,
-    /// Device time of the fires' final frames, summed as they land.
-    gpu_tail_ns: std::cell::Cell<u64>,
     held: Vec<u32>,
     out: Option<ValueId>,
     mtp: Option<ValueId>,
@@ -965,9 +960,6 @@ impl Shell {
             cuts,
             row_cuts,
             run_caps,
-            expert_fires: std::cell::Cell::new(0),
-            expert_report_every: boot.residency.report_every(),
-            gpu_tail_ns: std::cell::Cell::new(0),
             held: vec![0; boot.slots as usize],
             out,
             mtp,
@@ -1394,64 +1386,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn expert_hits(&self) -> (u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0), |tier| tier.borrow().hits())
-    }
-
-    /// Device time the expert pool's cut frames have taken so far.
-    #[must_use]
-    pub fn expert_gpu(&self) -> u64 {
-        self.weights.tier().map_or(0, |tier| tier.borrow().gpu_ns())
-    }
-
-    /// Bytes the expert pool has read from disk so far.
-    #[must_use]
-    pub fn expert_bytes(&self) -> u64 {
-        self.weights
-            .tier()
-            .map_or(0, |tier| tier.borrow().bytes_read())
-    }
-
-    /// The expert pool's running tally, if one is open.
-    #[must_use]
-    pub fn expert_cache_report(&self) -> Option<crate::experts::CacheReport> {
-        self.weights.tier().map(|tier| tier.borrow().report())
-    }
-
-    #[must_use]
-    pub fn expert_prediction(&self) -> crate::experts::Prediction {
-        self.weights
-            .tier()
-            .map_or_else(Default::default, |tier| tier.borrow().prediction())
-    }
-
-    #[must_use]
-    pub fn expert_host_time(&self) -> (u64, u64, u64) {
-        self.weights
-            .tier()
-            .map_or((0, 0, 0), |tier| tier.borrow().host_time())
-    }
-
-    #[must_use]
-    pub fn gathered_rows(&self) -> Option<crate::gather::Residency> {
-        self.weights.rows().map(|rows| rows.borrow().residency())
-    }
-
-    #[must_use]
-    pub fn gathered_motion(&self) -> Option<(u64, u64)> {
-        self.weights.rows().map(|rows| rows.borrow().motion())
-    }
-
-    #[must_use]
-    pub fn gathered_source(&self) -> Option<(&'static str, Option<(u64, u64)>)> {
-        self.weights
-            .rows()
-            .map(|rows| (rows.borrow().source_kind(), rows.borrow().backing()))
-    }
-
-    #[must_use]
     pub fn expert_source(&self) -> Option<(u64, u64)> {
         self.weights.tier().and_then(|tier| tier.borrow().source())
     }
@@ -1575,10 +1509,10 @@ impl Shell {
             return Ok(());
         };
         let waited = flight.pending.wait();
-        {
+        if let Some(tier) = self.weights.tier() {
             let (start, end) = flight.pending.gpu_span_us();
-            self.gpu_tail_ns
-                .set(self.gpu_tail_ns.get() + end.saturating_sub(start) * 1000);
+            tier.borrow_mut()
+                .note_tail(end.saturating_sub(start) * 1000);
         }
         if self
             .weights
@@ -4113,87 +4047,20 @@ impl engine::frame::Shell for Shell {
         }
         fire_trace(|| "encode-begin".to_string());
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
-            let trace = crate::diag::on().tier_trace;
-            let before = self.weights.tier().is_some().then(|| {
-                (
-                    self.expert_motion(),
-                    self.expert_hits(),
-                    self.expert_bytes(),
-                    self.expert_host_time(),
-                    self.expert_gpu(),
-                    self.gpu_tail_ns.get(),
-                    std::time::Instant::now(),
-                )
-            });
+            let started = std::time::Instant::now();
             let walked = self.walk_streamed(&prepared);
             // The fire is over however it went: the ring goes back to the
-            // pool before anything else is decided, and a walk that refused
-            // is the fault worth reporting.
+            // pool and the tier counts what the fire cost it before anything
+            // else is decided, and a walk that refused is the fault worth
+            // reporting.
             let ended = match self.weights.tier() {
-                Some(tier) => tier.borrow_mut().end_fire(),
+                Some(tier) => tier
+                    .borrow_mut()
+                    .end_fire(prepared.descriptor.rows, started.elapsed()),
                 None => Ok(()),
             };
             let walked = walked?;
             ended?;
-            if let Some((
-                (swaps0, cuts0),
-                (hits0, misses0),
-                bytes0,
-                (cut0, copy0, wait0),
-                gpu0,
-                tail0,
-                started,
-            )) = before
-            {
-                let (swaps, cuts) = self.expert_motion();
-                let (hits, misses) = self.expert_hits();
-                let (cut_ns, copy_ns, wait_ns) = self.expert_host_time();
-                let record = crate::experts::FireRecord {
-                    rows: prepared.descriptor.rows,
-                    cuts: cuts - cuts0,
-                    copies: swaps - swaps0,
-                    hits: hits - hits0,
-                    misses: misses - misses0,
-                    bytes_read: self.expert_bytes() - bytes0,
-                    cut_ms: (cut_ns - cut0) as f64 / 1e6,
-                    copy_ms: (copy_ns - copy0) as f64 / 1e6,
-                    wait_ms: (wait_ns - wait0) as f64 / 1e6,
-                    walk_ms: started.elapsed().as_secs_f64() * 1e3,
-                    gpu_cut_ms: (self.expert_gpu() - gpu0) as f64 / 1e6,
-                    gpu_tail_ms: (self.gpu_tail_ns.get() - tail0) as f64 / 1e6,
-                };
-                crate::experts::log_fire(&record);
-                if trace {
-                    eprintln!(
-                        "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} \
-                         misses, {:.1} MiB read; cuts {:.1} ms (copies {:.1} ms, waiting on \
-                         the device {:.1} ms, {:.1} ms of device time); walk {:.1} ms",
-                        record.rows,
-                        record.copies,
-                        record.cuts,
-                        record.hits,
-                        record.misses,
-                        record.bytes_read as f64 / (1u64 << 20) as f64,
-                        record.cut_ms,
-                        record.copy_ms,
-                        record.wait_ms,
-                        record.gpu_cut_ms,
-                        record.walk_ms,
-                    );
-                }
-                let fires = self.expert_fires.get() + 1;
-                self.expert_fires.set(fires);
-                let every = self.expert_report_every;
-                if every > 0
-                    && fires.is_multiple_of(every)
-                    && let Some(report) = self.expert_cache_report()
-                {
-                    eprintln!(
-                        "{report}; {fires} fires, final frames {:.1} ms on the device",
-                        self.gpu_tail_ns.get() as f64 / 1e6
-                    );
-                }
-            }
             walked
         } else {
             self.walk_once(&prepared, Mode::Encode)?

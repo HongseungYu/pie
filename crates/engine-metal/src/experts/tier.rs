@@ -13,7 +13,7 @@ use crate::weight_store::Store;
 use super::pool::{Band, Group, Hold, Pool};
 use super::source::Bytes;
 use super::tally;
-use super::{CACHE_ENV, CacheReport, GroupResidency, Plan, Prediction, Source, uncached};
+use super::{CACHE_ENV, CacheReport, GroupResidency, Plan, Source, uncached};
 
 /// Two whole layers of seats, borrowed from the pool for one prefill fire.
 /// A fire in which some lane has `min_rows` rows or more names nearly every
@@ -59,8 +59,7 @@ pub struct Tier {
     pool: Pool,
     ring: Option<Ring>,
     of_routes: BTreeMap<u32, usize>,
-    swaps: u64,
-    segments: u64,
+    tally: tally::Tally,
     threads: usize,
     /// What the read in flight will make resident once it lands.
     landing: Vec<(usize, u32, u32)>,
@@ -69,17 +68,9 @@ pub struct Tier {
     prefill_min: u32,
     /// Whether the fire open now is a prefill one, holding the ring.
     whole: bool,
-    hits: u64,
-    misses: u64,
-    bytes_read: u64,
-    distinct: u64,
     per_slot: u64,
     pairs: u64,
     policy: String,
-    cut_ns: u64,
-    copy_ns: u64,
-    wait_ns: u64,
-    gpu_ns: u64,
     hint_of: BTreeMap<u32, ValueId>,
     predicted: Vec<Option<Vec<Vec<u32>>>>,
     /// Where this load's seat tables start in the store, and how far apart
@@ -91,7 +82,6 @@ pub struct Tier {
     prefetch_k: usize,
     blocked: bool,
     dump: Option<std::io::BufWriter<std::fs::File>>,
-    prediction: Prediction,
 }
 
 const PREFETCH_K: usize = 4;
@@ -152,19 +142,10 @@ impl Tier {
                 wait_ns: 0,
             }),
             of_routes: BTreeMap::new(),
-            swaps: 0,
-            segments: 0,
-            hits: 0,
-            misses: 0,
-            bytes_read: 0,
-            distinct: 0,
+            tally: tally::Tally::new(plan.report_every()),
             per_slot: plan.per_slot,
             pairs: plan.pairs,
             policy: plan.policy.clone(),
-            cut_ns: 0,
-            copy_ns: 0,
-            wait_ns: 0,
-            gpu_ns: 0,
             hint_of: plan
                 .groups
                 .iter()
@@ -172,7 +153,6 @@ impl Tier {
                 .collect(),
             predicted: vec![None; plan.groups.len()],
             tables: (tables, plan.seat_table_stride()),
-            prediction: Prediction::default(),
             inflight: None,
             file: None,
             prefetch: crate::diag::on().route_prefetch,
@@ -256,7 +236,7 @@ impl Tier {
         // fire the shell refused after staging never ended; end it now,
         // rather than borrow twice.
         self.join_inflight()?;
-        self.end_fire()?;
+        self.return_ring()?;
         let whole = self.prefill_min > 0
             && lane_rows.iter().any(|&rows| rows >= self.prefill_min)
             && self.ring.is_some();
@@ -264,13 +244,50 @@ impl Tier {
         if whole {
             self.borrow_ring()?;
         }
+        self.tally.open();
         Ok(whole)
     }
 
-    /// Close the fire: the borrowed seats go back to the pool holding the
-    /// last two layers they were filled with, at the cold end of the LRU,
-    /// where a decode may hit them but an eviction takes them first.
-    pub fn end_fire(&mut self) -> Result<()> {
+    /// Close the fire: the ring goes back to the pool, and the pool says
+    /// what this fire cost it — a line in the CSV the load asked for, a
+    /// trace line under `tier-trace`, and every so often the whole report.
+    pub fn end_fire(&mut self, rows: u32, walk: std::time::Duration) -> Result<()> {
+        self.return_ring()?;
+        let record = self.tally.close(rows, walk);
+        tally::log_fire(&record);
+        if crate::diag::on().tier_trace {
+            eprintln!(
+                "tier: fire of {} row(s): {} seat copies over {} cuts, {} hits / {} \
+                 misses, {:.1} MiB read; cuts {:.1} ms (copies {:.1} ms, waiting on \
+                 the device {:.1} ms, {:.1} ms of device time); walk {:.1} ms",
+                record.rows,
+                record.copies,
+                record.cuts,
+                record.hits,
+                record.misses,
+                record.bytes_read as f64 / (1u64 << 20) as f64,
+                record.cut_ms,
+                record.copy_ms,
+                record.wait_ms,
+                record.gpu_cut_ms,
+                record.walk_ms,
+            );
+        }
+        if self.tally.due() {
+            eprintln!(
+                "{}; {} fires, final frames {:.1} ms on the device",
+                self.report(),
+                self.tally.fires(),
+                self.tally.tail_ns as f64 / 1e6
+            );
+        }
+        Ok(())
+    }
+
+    /// The borrowed seats go back to the pool holding the last two layers
+    /// they were filled with, at the cold end of the LRU, where a decode may
+    /// hit them but an eviction takes them first.
+    fn return_ring(&mut self) -> Result<()> {
         if !self.whole {
             return Ok(());
         }
@@ -346,7 +363,7 @@ impl Tier {
         };
         let started = std::time::Instant::now();
         let out = self.segment_at(at, arena, handles, routes, rect, hint, span);
-        self.cut_ns += started.elapsed().as_nanos() as u64;
+        self.tally.cut_ns += started.elapsed().as_nanos() as u64;
         out
     }
 
@@ -407,15 +424,15 @@ impl Tier {
                         continue;
                     }
                     let seated = self.groups[at].seat_of[expert as usize].is_some();
-                    self.prediction.total += 1;
+                    self.tally.prediction.total += 1;
                     if !seated {
-                        self.prediction.misses += 1;
+                        self.tally.prediction.misses += 1;
                     }
                     for (i, &k) in PREDICTION_PREFIXES.iter().enumerate() {
                         if ranked.iter().take(k).any(|&p| p == expert) {
-                            self.prediction.covered[i] += 1;
+                            self.tally.prediction.covered[i] += 1;
                             if !seated {
-                                self.prediction.saved[i] += 1;
+                                self.tally.prediction.saved[i] += 1;
                             }
                         }
                     }
@@ -454,7 +471,7 @@ impl Tier {
         // The cut that brought us here waited for the previous segment's
         // matmuls, so nothing on the device reads those seats any more.
         self.pool.release(Hold::Segment);
-        self.segments += 1;
+        self.tally.segments += 1;
         if self.whole {
             return self.ring_at(at, arena, handles, routes, rect, span);
         }
@@ -560,13 +577,13 @@ impl Tier {
                 continue;
             }
             if let Some(seat) = self.groups[at].seat_of[expert as usize] {
-                self.hits += 1;
+                self.tally.hits += 1;
                 self.pool.bump(seat);
                 self.pool.hold(seat, Hold::Segment);
                 taken.insert(expert, seat);
                 continue;
             }
-            self.misses += 1;
+            self.tally.misses += 1;
             let seat = self.take(at)?;
             self.pool.hold(seat, Hold::Segment);
             self.jobs(at, seat, expert, &mut seating.jobs);
@@ -602,9 +619,9 @@ impl Tier {
                 }
             }
         }
-        self.swaps += seating.jobs.len() as u64;
-        self.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
-        self.copy_ns += started.elapsed().as_nanos() as u64;
+        self.tally.swaps += seating.jobs.len() as u64;
+        self.tally.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
+        self.tally.copy_ns += started.elapsed().as_nanos() as u64;
         for (at, seat, expert) in seating.landing {
             self.assign(at, seat, expert);
         }
@@ -768,8 +785,8 @@ impl Tier {
         let writers = self.store.file_writers(&reads)?;
         let threads = self.threads;
         let bytes: u64 = reads.iter().map(|&(_, _, len)| len).sum();
-        self.bytes_read += bytes;
-        self.swaps += (copies.len() + reads.len()) as u64;
+        self.tally.bytes_read += bytes;
+        self.tally.swaps += (copies.len() + reads.len()) as u64;
         if let Some(ring) = self.ring.as_mut() {
             ring.fills += 1;
             ring.copied += copied;
@@ -812,8 +829,8 @@ impl Tier {
         if seating.jobs.is_empty() {
             return Ok(());
         }
-        self.swaps += seating.jobs.len() as u64;
-        self.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
+        self.tally.swaps += seating.jobs.len() as u64;
+        self.tally.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
         let writers = self.store.file_writers(&seating.jobs)?;
         self.landing = seating.landing;
         let threads = self.threads;
@@ -854,7 +871,7 @@ impl Tier {
             self.pool.hold(seat, Hold::Inflight);
             self.jobs(at, seat, expert, &mut seating.jobs);
             seating.landing.push((at, seat, expert));
-            self.prediction.prefetched += 1;
+            self.tally.prediction.prefetched += 1;
         }
         self.spawn(seating)
     }
@@ -916,7 +933,7 @@ impl Tier {
         self.pool.in_seat[seat as usize] = Some((at as u32, expert));
         if !self.groups[at].ever[expert as usize] {
             self.groups[at].ever[expert as usize] = true;
-            self.distinct += 1;
+            self.tally.distinct += 1;
         }
     }
 
@@ -953,14 +970,14 @@ impl Tier {
             pairs: self.pairs,
             per_slot: self.per_slot,
             resident: self.pool.resident(),
-            distinct: self.distinct,
-            hits: self.hits,
-            misses: self.misses,
-            bytes_read: self.bytes_read,
-            segments: self.segments,
-            copy_ns: self.copy_ns,
-            wait_ns: self.wait_ns,
-            gpu_ns: self.gpu_ns,
+            distinct: self.tally.distinct,
+            hits: self.tally.hits,
+            misses: self.tally.misses,
+            bytes_read: self.tally.bytes_read,
+            segments: self.tally.segments,
+            copy_ns: self.tally.copy_ns,
+            wait_ns: self.tally.wait_ns,
+            gpu_ns: self.tally.gpu_ns,
             ring_fills: ring.map_or(0, |r| r.fills),
             ring_copied: ring.map_or(0, |r| r.copied),
             ring_read: ring.map_or(0, |r| r.read),
@@ -971,31 +988,11 @@ impl Tier {
 
     #[must_use]
     pub fn motion(&self) -> (u64, u64) {
-        (self.swaps, self.segments)
-    }
-
-    #[must_use]
-    pub fn hits(&self) -> (u64, u64) {
-        (self.hits, self.misses)
-    }
-
-    #[must_use]
-    pub fn bytes_read(&self) -> u64 {
-        self.bytes_read
-    }
-
-    #[must_use]
-    pub fn prediction(&self) -> Prediction {
-        self.prediction
-    }
-
-    #[must_use]
-    pub fn host_time(&self) -> (u64, u64, u64) {
-        (self.cut_ns, self.copy_ns, self.wait_ns)
+        (self.tally.swaps, self.tally.segments)
     }
 
     pub fn note_wait(&mut self, ns: u64) {
-        self.wait_ns += ns;
+        self.tally.wait_ns += ns;
     }
 
     /// Whether the last segment read from disk, so the next cut's host phase
@@ -1006,13 +1003,13 @@ impl Tier {
     }
 
     /// Device time of a cut frame, as the command buffer reports it.
-    pub fn note_gpu(&mut self, ns: u64) {
-        self.gpu_ns += ns;
+    /// Device time of the fire's final frame, as it lands.
+    pub fn note_tail(&mut self, ns: u64) {
+        self.tally.tail_ns += ns;
     }
 
-    #[must_use]
-    pub fn gpu_ns(&self) -> u64 {
-        self.gpu_ns
+    pub fn note_gpu(&mut self, ns: u64) {
+        self.tally.gpu_ns += ns;
     }
 
     #[must_use]
@@ -1034,7 +1031,7 @@ impl Drop for Tier {
         {
             let _ = handle.join();
         }
-        if self.segments > 0 {
+        if self.tally.segments > 0 {
             eprintln!("{}", self.report());
         }
     }

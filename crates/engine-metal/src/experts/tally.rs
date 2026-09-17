@@ -151,3 +151,99 @@ pub fn log_fire(record: &FireRecord) {
     let _ = file.flush();
     *seq += 1;
 }
+
+/// What the pool has done, counted as it goes, and one fire's slice of it.
+/// The tier owns this: nothing outside reads a counter in order to subtract
+/// it from another one later.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Mark {
+    swaps: u64,
+    segments: u64,
+    hits: u64,
+    misses: u64,
+    bytes_read: u64,
+    cut_ns: u64,
+    copy_ns: u64,
+    wait_ns: u64,
+    gpu_ns: u64,
+    tail_ns: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct Tally {
+    pub(super) swaps: u64,
+    pub(super) segments: u64,
+    pub(super) hits: u64,
+    pub(super) misses: u64,
+    pub(super) bytes_read: u64,
+    pub(super) distinct: u64,
+    pub(super) cut_ns: u64,
+    pub(super) copy_ns: u64,
+    pub(super) wait_ns: u64,
+    pub(super) gpu_ns: u64,
+    /// Device time of the fires' final frames, summed as they land.
+    pub(super) tail_ns: u64,
+    pub(super) prediction: Prediction,
+    fires: u64,
+    report_every: u64,
+    at: Mark,
+}
+
+impl Tally {
+    pub(super) fn new(report_every: u64) -> Tally {
+        Tally {
+            report_every,
+            ..Tally::default()
+        }
+    }
+
+    fn mark(&self) -> Mark {
+        Mark {
+            swaps: self.swaps,
+            segments: self.segments,
+            hits: self.hits,
+            misses: self.misses,
+            bytes_read: self.bytes_read,
+            cut_ns: self.cut_ns,
+            copy_ns: self.copy_ns,
+            wait_ns: self.wait_ns,
+            gpu_ns: self.gpu_ns,
+            tail_ns: self.tail_ns,
+        }
+    }
+
+    /// A fire opens: what it does is what these counters move by.
+    pub(super) fn open(&mut self) {
+        self.at = self.mark();
+    }
+
+    /// A fire closes: its own slice, and one more fire on the count.
+    pub(super) fn close(&mut self, rows: u32, walk: std::time::Duration) -> FireRecord {
+        let at = self.at;
+        self.at = self.mark();
+        self.fires += 1;
+        FireRecord {
+            rows,
+            cuts: self.segments - at.segments,
+            copies: self.swaps - at.swaps,
+            hits: self.hits - at.hits,
+            misses: self.misses - at.misses,
+            bytes_read: self.bytes_read - at.bytes_read,
+            cut_ms: (self.cut_ns - at.cut_ns) as f64 / 1e6,
+            copy_ms: (self.copy_ns - at.copy_ns) as f64 / 1e6,
+            wait_ms: (self.wait_ns - at.wait_ns) as f64 / 1e6,
+            walk_ms: walk.as_secs_f64() * 1e3,
+            gpu_cut_ms: (self.gpu_ns - at.gpu_ns) as f64 / 1e6,
+            gpu_tail_ms: (self.tail_ns - at.tail_ns) as f64 / 1e6,
+        }
+    }
+
+    pub(super) fn fires(&self) -> u64 {
+        self.fires
+    }
+
+    /// Whether this fire is one the pool says a word about.
+    pub(super) fn due(&self) -> bool {
+        self.report_every > 0 && self.fires.is_multiple_of(self.report_every)
+    }
+}
