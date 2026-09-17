@@ -85,3 +85,33 @@ memory falling 12.94 -> 10.30 GiB at issue 05. At one memory: 140.5 ->
 122.4 s and 66% -> 72.6% of routes held, which is the borrowed ring paying
 for itself. Correctness held everywhere: every run decoded the recorded
 teacher-forced tokens exactly.
+
+## The measurement that answers the question asked
+
+The question is: from a cold pool, one prefill and 1024 decoded tokens,
+what does a step cost over the last 512? That is `--mode steps --warmup 0
+--reps 1`, which fires one teacher-forced request against a freshly started
+server and logs every fire. A step is the gap between two fires' `t_ms`, so
+one request answers for its own steps. `coldsteps.py` reads the last N off
+that log.
+
+`--reps` above 1 does not repeat this: only the first request meets a cold
+pool. Repeat by restarting the server.
+
+Cold, heater on, 1k prompt, 1024 teacher-forced tokens, this build:
+
+| knob | memory | last 512: mean | median | p10 | p90 | hit rate | misses/step |
+|---|---|---|---|---|---|---|---|
+| 4000 | 10.30 GiB | 117.74 ms | 116.06 | 89.83 | 146.51 | 0.705 | 141.8 |
+| 5024 | 12.94 GiB | 107.76 ms | 105.96 | 81.62 | 138.08 | 0.754 | 118.2 |
+
+The log accounts for the request: 1022 steps summing to 125.0 s (4000) and
+115.2 s (5024) against wall times of 133.6 s and 126.3 s, the rest being the
+prefill that the first decode fire's `t_ms` marks at 8.5 s and 11.0 s. The
+first 512 steps cost more than the last 512 (126.81 against 117.74; 117.68
+against 107.76), which is the pool filling after a prefill took the ring —
+the effect the `clean` mode's tail figure was trying to see and could not.
+
+A step's spread is wide (p10 to p90 is 57 ms at 4000 seats) because a step's
+cost is its miss count, so quote the median with the quantiles, not a mean
+alone.
