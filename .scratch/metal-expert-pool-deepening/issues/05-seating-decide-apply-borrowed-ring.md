@@ -54,11 +54,20 @@ returned seats are hits a decode can take. `Shell.ring_min`,
 Gate: clippy --all-targets clean, lib tests 20 passed.
 
 2026-09-17, harness gate (clean mode, 4000 seats, heater on, 1k prompt,
-1024 teacher-forced tokens): every forced-token assertion passed. Step
-118.10 ms mean (8.47 tok/s) and 80.28 ms over the last 512 (12.46 tok/s),
-against 119.78 / 96.70 ms at issue 04 and RESULTS.md's 130.40 ms baseline;
-decode hit rate 67.8% over the whole run, unchanged, but the seats the
-ring gives back turn the tail of a long decode markedly cheaper. The boot
-line reads `4000 seats ... 10.30 GiB ... 1024 of which a prefill fire
-borrows`: the same knob now costs 2.64 GiB less than when the ring was
-reserved beside the pool.
+1024 teacher-forced tokens): every forced-token assertion passed.
+
+Timing, corrected 2026-09-17 (see issue 13). What this run actually shows:
+`T(1024)` 132.42 s against issue 04's 133.35 s and issue 02's 133.30 s, so
+no measurable change end to end; decode hit rate 67.8%, the same as both;
+and 942.6 GiB read from disk against 931.2 GiB at issue 02, because the
+borrowed ring finds fewer of a layer's experts already seated to copy from
+(8928 copied against 12000). The boot line reads `4000 seats ... 10.30 GiB
+... 1024 of which a prefill fire borrows`: the same knob costs 2.64 GiB
+less than when the ring was reserved beside the pool, which is the change's
+real win.
+
+The first report of this run claimed the last-512 figure fell from 109 to
+80 ms because the returned ring seats were free hits for the decode behind
+them. That was wrong twice over: the hit rate did not move, and a later run
+of functionally identical code (the cleanup gate) read 122.24 ms for the
+same figure. See issue 13.

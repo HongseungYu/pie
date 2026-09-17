@@ -53,8 +53,11 @@ Untested path: the bf16 `select_gemv` point, which no imported model uses.
 
 2026-09-17, harness gate (clean mode, 4000 seats, heater on, 1k prompt,
 1024 teacher-forced tokens): every forced-token assertion passed, so the
-indirection decodes exactly what rewriting the routes did. Step 119.78 ms
-mean (8.35 tok/s) and 96.70 ms over the last 512 (10.34 tok/s), against
-issue 02's 122.36 / 109.40 ms on the same run shape; decode hit rate 67.8%
-(was 67.9%). The batched point no longer falls back to the per-row kernel
-on a pool-seated fire, which is where the last-half gain comes from.
+indirection decodes exactly what rewriting the routes did.
+
+Timing, corrected 2026-09-17 (see issue 13): `T(1024)` 133.35 s against
+issue 02's 133.30 s, i.e. no measurable change end to end. The per-step
+figures first reported here (119.78 ms mean, 96.70 ms last half) are the
+harness's difference of separate requests and carry run-to-run prefill
+variance, not a speed-up; the claim that the batched point stopped falling
+back is true of the code, but this run does not measure it.

@@ -45,9 +45,16 @@ free.
 2026-09-17, harness gate (clean mode, 4000 seats, heater on, 1k prompt,
 1024 teacher-forced tokens, `PIE_BIN` pointed at this branch's release
 build): every forced-token assertion passed, so seating decodes exactly
-what it did before. Step 122.36 ms mean (8.17 tok/s), 109.40 ms over the
-last 512 (9.14 tok/s) against RESULTS.md's 130.40/130.17 ms baseline;
-decode hit rate 67.9% against 66%. No regression; the gain is the ring
-fire reaching the batched kernel again (0f1155a6), which the baseline run
-predates. The boot line reads `4000 seats ... + a prefill ring of 1024
-seats`, i.e. the floor is now one layer (E = 512) and the ring is 2E.
+what it did before.
+
+Timing, corrected 2026-09-17 after a second look (see issue 13): the
+harness's `step_ms_mean` and `step_ms_last_half` are differences between
+three separate requests, each of which re-prefills the prompt, and prefill
+here is read-bound on a drive whose effective rate swings run to run. The
+number that survives is `T(1024)`, one request end to end: 133.30 s here
+against the RESULTS.md baseline's 140.49 / 140.66 s, about 5% better. The
+per-step figures first reported from this run (122.36 ms mean, 109.40 ms
+last half) are not evidence of that or of anything else.
+
+The boot line reads `4000 seats ... + a prefill ring of 1024 seats`, i.e.
+the floor is now one layer (E = 512) and the ring is 2E.
