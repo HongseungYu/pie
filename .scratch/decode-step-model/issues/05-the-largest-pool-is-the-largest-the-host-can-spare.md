@@ -49,3 +49,25 @@ the pool has wired most of the host's memory those pages are evicted between use
 re-faulted from disk — the previous effort saw `ple_host` swing 0.1-1.2 ms with the page
 cache at 4000 seats. From commit (this one) the fire record carries `ple_ms`, the gather's
 own host time, so the reader shows it apart from the encode.
+
+## `ple_ms` measured (2026-09-17 18:40, `sm-d1-tail-s8192`, `sm-d2-tail-s11204`; the sequence's tail, 128 tokens)
+
+| seats | pass | misses/step | `ple_ms` | `enc` (encode proper) | swap during the run |
+|---|---|---|---|---|---|
+| 8192 | prime | 94.7 | **6.10** | 1.11 | 1.97 -> 2.52 GB |
+| 8192 | resident | 76.5 | **0.06** | 1.04 | |
+| 11204 | prime | 78.5 | 5.77 | 1.00 | 2.52 -> 3.07 GB |
+| 11204 | resident | 37.2 | **5.64** | 0.91 | |
+
+That is the whole of it: the walk's encode proper is 1.0-1.1 ms a step at any pool, and the
+n-gram row gather is 0.06 ms when its pages are cached and ~6 ms when each step faults them
+in. At 8192 seats the prime pass warms them and the resident pass finds them; at 11204 the
+host is paging (swap grows half a gigabyte during a one-minute run) and the resident pass
+faults them again 20 seconds later. A model with one F can hold the first case and not the
+second, so the largest pool this effort measures is the largest at which the n-gram pages
+survive between requests, and every `steps` run warms the whole sequence first.
+
+Also from these two runs: replaying the sequence's looping tail does not shrink the routed
+union (76 misses a step in the resident pass at 8192, 37 at 11204): a repeated token in a
+different context routes to different experts. The zero-miss window stays what a pool holds
+of the head, about 64 steps.
