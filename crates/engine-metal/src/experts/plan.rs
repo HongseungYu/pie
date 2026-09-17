@@ -6,7 +6,7 @@ use model_ir::Trace;
 
 use crate::error::{Fault, Result};
 
-use super::*;
+use super::trace::{Attachments, GroupPlan, fan_out, found};
 
 /// How many routed-expert seats the shared pool holds.
 ///
@@ -708,5 +708,27 @@ impl Plan {
             self.pairs,
             self.policy,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytes_parse() {
+        assert_eq!(parse_bytes("4GiB"), Some(4 << 30));
+        assert_eq!(parse_bytes("4G"), Some(4 << 30));
+        assert_eq!(parse_bytes(" 512 MiB "), Some(512 << 20));
+        assert_eq!(parse_bytes("1024"), Some(1024));
+        assert_eq!(parse_bytes("1.5GiB"), Some(3 << 29));
+        assert_eq!(parse_bytes("lots"), None);
+    }
+
+    #[test]
+    fn free_ram_reads_on_apple() {
+        if cfg!(target_vendor = "apple") {
+            assert!(free_ram().is_some_and(|bytes| bytes > 0));
+        }
     }
 }

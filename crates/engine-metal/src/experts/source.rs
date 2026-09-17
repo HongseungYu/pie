@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::host_source::HostSource;
 use crate::mapping::Mapping;
 
-use super::*;
+use super::plan::Plan;
 
 #[derive(Debug)]
 pub(super) enum Bytes {

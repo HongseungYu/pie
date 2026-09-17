@@ -7,7 +7,7 @@ use model_ir::{Def, Linear, Operands, Operation, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
-use super::*;
+use super::plan::{BandPlan, Plan};
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 

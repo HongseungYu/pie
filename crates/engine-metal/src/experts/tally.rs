@@ -1,6 +1,6 @@
 // New on this branch: what the pool reports and logs.
 
-use super::*;
+use super::plan::gib;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Prediction {
