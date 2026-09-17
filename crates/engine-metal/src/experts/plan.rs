@@ -369,9 +369,14 @@ impl Plan {
             .max()
             .unwrap_or(1)
             .max(1);
-        let need = (1..=u32::MAX)
-            .find(|&n| pass_group(n) >= fan)
-            .unwrap_or(fan);
+        // One segment seats every distinct expert it routes to at once, and
+        // that is at most one layer's experts: a segment never runs in passes.
+        let need = groups
+            .iter()
+            .map(|group| group.experts)
+            .max()
+            .unwrap_or(1)
+            .max(1);
         let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
         let experts = groups[0].experts;
         let prefill_min = prefill_min(experts, fan);
@@ -408,8 +413,8 @@ impl Plan {
                     return Err(Fault::Residency(format!(
                         "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
                          demand {dense} resident and its {} routed bands need {need} expert \
-                         seats in the shared pool on top (a row routes to {fan} experts and a \
-                         pass seats half the pool){}, which is {floor}. Dense planes do not \
+                         seats in the shared pool on top (one segment seats every expert of \
+                         a layer at once){}, which is {floor}. Dense planes do not \
                          stream in this build, so the budget cannot be met by holding less. \
                          Raise it to at least {floor}, or state `None`.",
                         bands.len(),
@@ -422,9 +427,9 @@ impl Plan {
             Policy::Slots(n) => {
                 if n < need {
                     return Err(Fault::Residency(format!(
-                        "`{CACHE_ENV}={n}` seats fewer experts than one row routes to: a \
-                         row reads {fan} experts and a pass seats half the pool, so the pool \
-                         needs at least {need} seats"
+                        "`{CACHE_ENV}={n}` seats fewer experts than one layer has: a segment \
+                         seats every expert it routes to at once, so the pool needs at least \
+                         {need} seats"
                     )));
                 }
                 (n.min(ceiling), format!("{CACHE_ENV}={n}"))

@@ -49,9 +49,7 @@ pub struct Diagnostics {
     pub kernel_profile: Profile,
     pub kernel_dump: Option<PathBuf>,
     pub route_dump: Option<PathBuf>,
-    pub pass_half: bool,
     pub route_prefetch: bool,
-    pub expert_passes: bool,
     pub keepalive: bool,
     pub scratch_no_zero: bool,
     pub host_rows: bool,
@@ -83,9 +81,7 @@ impl Default for Diagnostics {
             kernel_profile: Profile::Off,
             kernel_dump: None,
             route_dump: None,
-            pass_half: true,
             route_prefetch: true,
-            expert_passes: true,
             keepalive: true,
             scratch_no_zero: false,
             host_rows: false,
@@ -131,8 +127,8 @@ fn number<T: std::str::FromStr>(word: &str, value: &str) -> std::result::Result<
 
 const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
-     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, `pass-half=off`, \
-     `route-prefetch=off`, `expert-passes=off`, `keepalive=off`, \
+     `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, \
+     `route-prefetch=off`, `keepalive=off`, \
      `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
      `prefetch-k=<n>`, `seat-threads=<n>`, `keepalive-iters=<n>`, \
      `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
@@ -160,9 +156,7 @@ impl std::str::FromStr for Diagnostics {
                 "fire-trace" => diag.fire_trace = switch(word, value)?,
                 "region-trace" => diag.region_trace = switch(word, value)?,
                 "streamed-trace" => diag.streamed_trace = switch(word, value)?,
-                "pass-half" => diag.pass_half = switch(word, value)?,
                 "route-prefetch" => diag.route_prefetch = switch(word, value)?,
-                "expert-passes" => diag.expert_passes = switch(word, value)?,
                 "keepalive" => diag.keepalive = switch(word, value)?,
                 "scratch-no-zero" => diag.scratch_no_zero = switch(word, value)?,
                 "host-rows" => diag.host_rows = switch(word, value)?,
@@ -295,14 +289,14 @@ mod tests {
     }
 
     fn a_word_list_names_each_knob() {
-        let diag: Diagnostics = "tier-trace, kernel-profile=2 ,pass-half=off,streamed-nop=3"
+        let diag: Diagnostics = "tier-trace, kernel-profile=2 ,route-prefetch=off,streamed-nop=3"
             .parse()
             .expect("the four words parse");
         assert!(diag.tier_trace);
         assert_eq!(diag.kernel_profile, Profile::Shaped);
         assert!(diag.kernel_profile.shaped());
         assert_eq!(diag.kernel_profile.rows(), 60);
-        assert!(!diag.pass_half);
+        assert!(!diag.route_prefetch);
         assert_eq!(diag.streamed_nop, 3);
         assert!(diag.keepalive, "an unnamed arm keeps its default");
     }

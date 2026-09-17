@@ -60,7 +60,6 @@ pub struct Cuts<'a> {
     tier: Option<&'a RefCell<Tier>>,
     rows: Option<&'a RefCell<crate::gather::Slab>>,
     seen: std::cell::Cell<(u32, u32)>,
-    groups: std::cell::Cell<u32>,
     /// A prefill fire: some lane has the ring's row count or more, so every
     /// streamed segment runs over the ring rather than the pool.
     whole: bool,
@@ -90,7 +89,6 @@ impl<'a> Cuts<'a> {
             tier,
             rows,
             seen: std::cell::Cell::new((u32::MAX, u32::MAX)),
-            groups: std::cell::Cell::new(1),
             whole,
         }
     }
@@ -171,17 +169,9 @@ impl<'a> Sink<'a> {
             cuts,
             routes,
             "a routing vector",
-            |rect, span, pass, arena| {
-                tier.borrow_mut().segment(
-                    arena,
-                    self.handles,
-                    routes,
-                    rect,
-                    hint,
-                    span,
-                    pass,
-                    cuts.whole,
-                )
+            |rect, span, arena| {
+                tier.borrow_mut()
+                    .segment(arena, self.handles, routes, rect, hint, span, cuts.whole)
             },
         )
     }
@@ -200,10 +190,9 @@ impl<'a> Sink<'a> {
             cuts,
             ids,
             "an n-gram id vector",
-            |rect, span, _pass, arena| {
+            |rect, span, arena| {
                 rows.borrow_mut()
                     .segment(arena, self.handles, ids, rect, span)
-                    .map(|()| 1)
             },
         )
     }
@@ -215,7 +204,7 @@ impl<'a> Sink<'a> {
         cuts: &Cuts<'_>,
         vector: ValueId,
         what: &str,
-        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<u32>,
+        seat: impl FnOnce(Tensor, MaskSpan, &mut Buffer) -> crate::error::Result<()>,
     ) -> Result<(), Error> {
         let Held::Owned(cell) = &self.frame else {
             return Ok(());
@@ -258,24 +247,18 @@ impl<'a> Sink<'a> {
             })?;
         let window = cuts.windows.at(region, cuts.place.run.get());
         let span = window.span;
-        let pass = (window.pass, window.passes);
         if crate::diag::on().cut_trace {
             eprintln!(
-                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {}; pass {} of {})",
+                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {})",
                 cuts.place.run.get(),
                 span.row_offset,
                 span.row_offset + span.rows,
                 vector.0,
                 rect.rows,
-                rect.width,
-                pass.0,
-                pass.1
+                rect.width
             );
         }
-        let groups = seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
-        if pass.0 == 0 {
-            cuts.groups.set(groups);
-        }
+        seat(rect, span, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
 
         *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
         Ok(())
@@ -352,16 +335,6 @@ impl Encode for Sink<'_> {
                 if cuts.seen.get() != here {
                     cuts.seen.set(here);
                     self.cut(fire, cuts)?;
-                }
-                let window = cuts.windows.at(here.0, here.1);
-                if window.passes > 1 {
-                    let groups = cuts.groups.get().max(1);
-                    let in_tail = cuts.place.tail.get();
-                    let last = window.pass + 1 == groups;
-                    let empty = window.pass >= groups;
-                    if (in_tail && !last) || (!in_tail && empty) {
-                        return Ok(());
-                    }
                 }
             }
             let pipeline = self

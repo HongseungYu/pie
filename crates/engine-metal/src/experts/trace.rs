@@ -11,14 +11,6 @@ use super::*;
 
 pub type Attachments = BTreeMap<usize, Vec<usize>>;
 
-#[must_use]
-pub fn pass_group(slots: u32) -> u32 {
-    if !crate::diag::on().pass_half {
-        return slots.max(1);
-    }
-    (slots / 2).max(1)
-}
-
 #[derive(Debug, Clone)]
 pub struct GroupPlan {
     pub routes: ValueId,

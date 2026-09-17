@@ -17,8 +17,6 @@ pub struct Window {
     pub indptr_host: Vec<i32>,
     pub indptr: Tensor,
     pub gathered: Option<Gathered>,
-    pub pass: u32,
-    pub passes: u32,
     pub patch: MaskSpan,
     pub voxel: MaskSpan,
 }
@@ -171,8 +169,6 @@ pub fn gathers(trace: &Trace, compiled: &CompiledModel) -> usize {
 fn seat(windows: &mut Vec<Window>, window: Window) -> u32 {
     let same = |held: &Window| {
         held.span == window.span
-            && held.pass == window.pass
-            && held.passes == window.passes
             && held.gathered.as_ref().map(|g| &g.runs) == window.gathered.as_ref().map(|g| &g.runs)
     };
     let index = match windows.iter().position(same) {
@@ -264,8 +260,6 @@ fn gather_of(runs: &[MaskSpan], indptr_host: &[i32], copies: Copies<'_>) -> Wind
         }),
         patch: MaskSpan::default(),
         voxel: MaskSpan::default(),
-        pass: 0,
-        passes: 1,
     }
 }
 
@@ -280,7 +274,6 @@ impl Windows {
         indptr_host: &[i32],
         copies: Copies<'_>,
         run_caps: &[u32],
-        run_passes: &[u32],
     ) -> Result<Windows> {
         let mut windows: Vec<Window> = Vec::new();
         let mut runs: Vec<u32> = Vec::with_capacity(compiled.template().len());
@@ -341,21 +334,12 @@ impl Windows {
             }
 
             let cap = run_caps.get(at).copied().unwrap_or(0);
-            let max_passes = run_passes.get(at).copied().unwrap_or(0);
-            let (capped, passes) = if cap > 0 && max_passes > 1 {
-                (
-                    false,
-                    model_exec::fire::pass_spans(&mut spans, cap, max_passes),
-                )
-            } else {
-                let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
-                if capped {
-                    model_exec::fire::chunk_spans(&mut spans, cap);
-                }
-                (capped, 1)
-            };
+            let capped = cap > 0 && spans.iter().any(|span| span.rows > cap);
+            if capped {
+                model_exec::fire::chunk_spans(&mut spans, cap);
+            }
             of_region.push((runs.len() as u32, spans.len() as u32));
-            for (i, &span) in spans.iter().enumerate() {
+            for &span in &spans {
                 let window = Window {
                     span,
                     indptr_host: match axis {
@@ -367,8 +351,6 @@ impl Windows {
                     gathered: None,
                     patch,
                     voxel,
-                    pass: (i as u32) % passes,
-                    passes,
                 };
                 runs.push(seat(&mut windows, window));
             }
@@ -498,7 +480,6 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
 pub struct At {
     pub region: Cell<u32>,
     pub run: Cell<u32>,
-    pub tail: Cell<bool>,
 }
 
 impl At {
@@ -538,10 +519,6 @@ impl Sink for Cursor<'_> {
 
     fn run(&mut self, run: u32, _runs: u32) {
         self.place.run.set(run);
-        self.place.tail.set(false);
-    }
-    fn tail(&mut self, in_tail: bool) {
-        self.place.tail.set(in_tail);
     }
     fn cond_begin(&mut self, _lowering: &Lowering) {}
     fn cond_arm(&mut self, _arm: u8) {}

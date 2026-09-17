@@ -302,7 +302,6 @@ pub struct Shell {
     cuts: Vec<Option<ValueId>>,
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
-    run_passes: Vec<u32>,
     /// Rows in one lane from which a fire is prefill and takes the ring; 0
     /// when the tier has no ring.
     ring_min: u32,
@@ -453,35 +452,6 @@ impl Shell {
                 let stated = kernels_metal::tuning::current().stream_rows_per_cut;
                 match (routes, slots) {
                     (Some(_), slots) if slots > 0 && stated > 0 => stated,
-                    (Some(routes), slots) if slots > 0 => {
-                        crate::experts::fan_out(&boot.trace, routes)
-                            .map_or(0, |k| (slots / k.max(1)).max(1))
-                    }
-                    _ => 0,
-                }
-            })
-            .collect();
-        let passes_on = crate::diag::on().expert_passes;
-        let run_passes: Vec<u32> = (0..compiled.template().len())
-            .map(|region| {
-                let routes = region
-                    .checked_sub(1)
-                    .and_then(|router| cuts.get(router).copied().flatten());
-                match routes {
-                    Some(routes) if passes_on => boot
-                        .residency
-                        .groups()
-                        .iter()
-                        .find(|group| group.routes == routes)
-                        .map_or(0, |group| {
-                            if group.slots > 0 {
-                                group
-                                    .experts
-                                    .div_ceil(crate::experts::pass_group(group.slots))
-                            } else {
-                                0
-                            }
-                        }),
                     _ => 0,
                 }
             })
@@ -492,15 +462,14 @@ impl Shell {
             0
         };
         if crate::diag::on().cut_trace {
-            let capped: Vec<(usize, u32, u32)> = run_caps
+            let capped: Vec<(usize, u32)> = run_caps
                 .iter()
-                .zip(&run_passes)
                 .enumerate()
-                .filter(|(_, (cap, _))| **cap > 0)
-                .map(|(at, (cap, passes))| (at, *cap, *passes))
+                .filter(|(_, cap)| **cap > 0)
+                .map(|(at, cap)| (at, *cap))
                 .collect();
             eprintln!(
-                "cuts: slots {} capped regions (region, cap, passes) {capped:?}",
+                "cuts: slots {} capped regions (region, cap) {capped:?}",
                 boot.residency.slots()
             );
         }
@@ -999,7 +968,6 @@ impl Shell {
             cuts,
             row_cuts,
             run_caps,
-            run_passes,
             ring_min,
             expert_fires: std::cell::Cell::new(0),
             gpu_tail_ns: std::cell::Cell::new(0),
@@ -2603,15 +2571,14 @@ impl Shell {
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let mut descriptor = FireDescriptor::of(&composition);
         // A prefill fire runs its routed matmuls over the ring, which holds
-        // every expert of the layer: no row cap and no passes for it.
+        // every expert of the layer: no row cap for it.
         let whole = self.ring_min > 0 && lane_rows.iter().any(|&rows| rows >= self.ring_min);
-        let (run_caps, run_passes) = if whole {
-            (vec![0; self.run_caps.len()], vec![0; self.run_passes.len()])
+        let run_caps = if whole {
+            vec![0; self.run_caps.len()]
         } else {
-            (self.run_caps.clone(), self.run_passes.clone())
+            self.run_caps.clone()
         };
         descriptor.run_caps = run_caps.clone();
-        descriptor.run_passes = run_passes.clone();
         let rows = composition.rows();
         let lane_count = composition.lane_count();
 
@@ -2946,7 +2913,6 @@ impl Shell {
                 request_of_token: &request_of_token,
             },
             &run_caps,
-            &run_passes,
         )?;
         self.last = FireCost {
             launches: windows.launches(),

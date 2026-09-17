@@ -24,15 +24,7 @@ use source::Bytes;
 pub use source::Source;
 pub use tally::{CacheReport, FireRecord, Prediction, log_fire};
 use trace::found;
-pub use trace::{Attachments, GroupPlan, GroupResidency, cuts, fan_out, pass_group};
-
-#[derive(Clone, Debug)]
-struct Passing {
-    row_offset: u32,
-    rows: u32,
-    ids: Vec<i32>,
-    groups: Vec<Vec<u32>>,
-}
+pub use trace::{Attachments, GroupPlan, GroupResidency, cuts, fan_out};
 
 #[derive(Debug)]
 struct Band {
@@ -197,7 +189,6 @@ pub struct Tier {
     gpu_ns: u64,
     hint_of: BTreeMap<u32, ValueId>,
     predicted: Vec<Option<Vec<Vec<u32>>>>,
-    passing: Vec<Option<Passing>>,
     /// Per group: the first seat of the ring half its routes were last
     /// rewritten to, `None` when they were seated into the pool.
     on_ring: Vec<Option<u32>>,
@@ -223,7 +214,7 @@ impl Tier {
     /// `(count, first)`: `None` when this tier does not seat the group (the
     /// router's own expert ids); `experts` seats from the ring half's first
     /// seat after `ring_at`; else any of the pool's seats plus the ring's
-    /// (`pass_at` and `segment_rows` seat wherever the LRU lands them).
+    /// (`segment_rows` seats wherever the LRU lands them).
     #[must_use]
     pub fn route_ids(&self, routes: ValueId, experts: u32) -> Option<(u32, u32)> {
         let at = *self.of_routes.get(&routes.0)?;
@@ -274,7 +265,6 @@ impl Tier {
                 .filter_map(|group| group.hint.map(|hint| (group.routes.0, hint)))
                 .collect(),
             predicted: vec![None; plan.groups.len()],
-            passing: vec![None; plan.groups.len()],
             on_ring: vec![None; plan.groups.len()],
             prediction: Prediction::default(),
             inflight: None,
@@ -354,14 +344,13 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
-        pass: (u32, u32),
         whole: bool,
-    ) -> Result<u32> {
+    ) -> Result<()> {
         let Some(&at) = self.of_routes.get(&routes.0) else {
-            return Ok(1);
+            return Ok(());
         };
         let started = std::time::Instant::now();
-        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, pass, whole);
+        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, whole);
         self.cut_ns += started.elapsed().as_nanos() as u64;
         out
     }
@@ -465,9 +454,8 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
-        pass: (u32, u32),
         whole: bool,
-    ) -> Result<u32> {
+    ) -> Result<()> {
         self.join_inflight()?;
         self.on_ring[at] = None;
         if whole && self.ring.is_some() {
@@ -475,11 +463,7 @@ impl Tier {
         }
         // a fill a refused fire left in flight copies from seats this segment evicts
         self.ring_join(usize::MAX)?;
-        if pass.1 > 1 {
-            return self.pass_at(at, arena, handles, routes, rect, span, pass);
-        }
-        self.segment_rows(at, arena, handles, routes, rect, hint, span)?;
-        Ok(1)
+        self.segment_rows(at, arena, handles, routes, rect, hint, span)
     }
 
     /// The routing vector's rows as raw bytes, and where they live.
@@ -575,127 +559,6 @@ impl Tier {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn pass_at(
-        &mut self,
-        at: usize,
-        arena: &mut Buffer,
-        handles: &Handles,
-        routes: ValueId,
-        rect: Tensor,
-        span: MaskSpan,
-        (pass, passes): (u32, u32),
-    ) -> Result<u32> {
-        self.pool.pinned.fill(false);
-        self.segments += 1;
-        if span.rows == 0 {
-            return Ok(0);
-        }
-        let width = u64::from(rect.width);
-        let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
-        let fresh = pass == 0
-            || self.passing[at]
-                .as_ref()
-                .is_none_or(|p| p.row_offset != span.row_offset || p.rows != span.rows);
-        let first = if fresh {
-            let (first, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
-            self.dump_rows(at, &raw, width as usize);
-            let ids: Vec<i32> = raw
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]))
-                .collect();
-            let mut order: Vec<u32> = Vec::new();
-            for &id in &ids {
-                if id < 0 {
-                    continue;
-                }
-                let expert = id as u32;
-                if expert >= self.groups[at].experts {
-                    return Err(Fault::Residency(format!(
-                        "a routing vector names expert {expert} and `{}` declares {} of them; \
-                         a seat cannot be found for an expert the router does not have.",
-                        self.groups[at].bands[0].name, self.groups[at].experts
-                    )));
-                }
-                if !order.contains(&expert) {
-                    order.push(expert);
-                }
-            }
-            let seat_of = &self.groups[at].seat_of;
-            let (mut leading, trailing): (Vec<u32>, Vec<u32>) = order
-                .into_iter()
-                .partition(|&e| seat_of[e as usize].is_some());
-            leading.extend(trailing);
-            let order = leading;
-            let seats = pass_group(self.pool.slots) as usize;
-            let groups = order.chunks(seats).map(<[u32]>::to_vec).collect();
-            self.passing[at] = Some(Passing {
-                row_offset: span.row_offset,
-                rows: span.rows,
-                ids,
-                groups,
-            });
-            first
-        } else {
-            let row = handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "handle {}, the routing vector of value {}, which this fire minted no \
-                     row for",
-                    rect.buf, routes.0
-                ),
-            })?;
-            row.offset() + u64::from(span.row_offset) * width * 4
-        };
-        let (ids, group, next) = {
-            let state = self.passing[at].as_ref().expect("stated just above");
-            (
-                state.ids.clone(),
-                state.groups.get(pass as usize).cloned().unwrap_or_default(),
-                state.groups.get(pass as usize + 1).cloned(),
-            )
-        };
-        let _ = passes;
-        let mut seat_of: BTreeMap<u32, i32> = BTreeMap::new();
-        for &expert in &group {
-            let seat = self.seat(at, expert)?;
-            seat_of.insert(expert, seat as i32);
-        }
-        let mut raw = Vec::with_capacity(count * 4);
-        let mut assigned = 0usize;
-        for id in ids {
-            let entry = if id < 0 {
-                -1
-            } else {
-                seat_of.get(&(id as u32)).copied().unwrap_or(-1)
-            };
-            if entry >= 0 {
-                assigned += 1;
-            }
-            raw.extend_from_slice(&entry.to_le_bytes());
-        }
-        if crate::diag::on().cut_trace {
-            let seats: Vec<i32> = seat_of.values().copied().collect();
-            eprintln!(
-                "pass {pass} of {passes} on group {at}: group of {} experts (seats {:?}), {assigned} of {count} entries assigned, groups {}",
-                group.len(),
-                seats,
-                self.passing[at].as_ref().map_or(0, |p| p.groups.len())
-            );
-        }
-        self.flush()?;
-        arena.write(first, &raw)?;
-        if self.prefetch
-            && let Some(next) = next
-        {
-            self.prefetch_group(at, &next)?;
-        }
-        Ok(self.passing[at]
-            .as_ref()
-            .map_or(0, |p| p.groups.len() as u32))
-    }
-
     /// A prefill segment: the layer's matmuls run over the ring half that
     /// holds the whole layer, and the next layer's half fills meanwhile.
     fn ring_at(
@@ -706,7 +569,7 @@ impl Tier {
         routes: ValueId,
         rect: Tensor,
         span: MaskSpan,
-    ) -> Result<u32> {
+    ) -> Result<()> {
         self.pool.pinned.fill(false);
         self.segments += 1;
         let half = self.ring_ready(at)?;
@@ -743,7 +606,7 @@ impl Tier {
         if at + 1 < self.groups.len() && !self.ring_has(at + 1) {
             self.ring_fill(at + 1, 1 - half)?;
         }
-        Ok(1)
+        Ok(())
     }
 
     fn ring_has(&self, group: usize) -> bool {
@@ -920,24 +783,6 @@ impl Tier {
         for expert in wanted {
             if let Some(seat) = self.groups[at].seat_of[expert as usize] {
                 self.pool.bump(seat);
-                continue;
-            }
-            let Ok(seat) = self.place(at, expert) else {
-                break;
-            };
-            self.jobs(at, seat, expert, &mut jobs);
-            self.prediction.prefetched += 1;
-        }
-        self.spawn(jobs)
-    }
-
-    fn prefetch_group(&mut self, at: usize, experts: &[u32]) -> Result<()> {
-        if self.file.is_none() {
-            return Ok(());
-        }
-        let mut jobs: Vec<Job> = Vec::new();
-        for &expert in experts {
-            if self.groups[at].seat_of[expert as usize].is_some() {
                 continue;
             }
             let Ok(seat) = self.place(at, expert) else {
