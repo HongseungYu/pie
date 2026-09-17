@@ -50,6 +50,9 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 7 | The heater is `alu` 1024 x 8192, two in flight, armed at every gap (issue 02). | Cut frames 29.7 at no misses, 31.5 at 331; every other shape loses on one end. |
 | 8 | "Largest pool" is 8192 seats, not the 11204 that boots: from 9216 up the OS evicts the n-gram table's pages between requests and a step pays ~6 ms of faults (issue 05). | An operating-system cost no fixed F can carry. |
 | 9 | Zero-miss windows are 40 tokens, three reps; `steps` runs warm the whole sequence first. | What 8192 seats hold of the head beside two ring borrows; the page cache. |
+| 10 | a, b are the minimax pick over the four configurations' windows; the planted grid checks the form's structure but not its coefficients. | The drive's cache serves a planted re-read below a cold miss's price (issue 07). |
+| 11 | A step whose reads cost > 1.5x the drive's curve is a drive stall and set aside, counted and shown; runs spoiled whole are rerun and the originals kept. | The drive pauses for seconds every ten minutes or so; no fixed a, b can carry it (issue 07). |
+| 12 | Reads within seconds of a 55 GiB prefill burst (the 128-token `all_in_mem` window) are a fifth regime, reported apart. | 0.60 ms a miss against 0.53; the drive's, not the engine's. |
 
 ## Plan
 
@@ -57,5 +60,6 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 - 02 heater knobs + sweep (GPU clock).
 - 03 read-path probe + knob (host warmth).
 - 04 forced-miss knob.
-- 05 the four configurations + mid points under the conditioned settings.
-- 06 fit, validate, iterate; `RESULTS.md` and a simulator config.
+- 05 the largest pool the host can spare (memory pressure, the n-gram page cache).
+- 06 a pool at the floor refuses a second prefill (fixed).
+- 07 the fit and the four configurations; `RESULTS.md` and `out/sim/configs/mac_m4pro_qwen38flash_np1_v2.json`.

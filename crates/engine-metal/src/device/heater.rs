@@ -30,11 +30,13 @@
 //! layer). Hence the knobs below, so the policy and the kernel's shape can
 //! be swept without a rebuild.
 //!
-//! `PIE_METAL_HEATER=<MiB>` turns it on (`on` for 16 MiB; `0` or `off` for
-//! the default, off), `PIE_METAL_HEATER_INFLIGHT` how many are queued
-//! ahead (2). `PIE_METAL_HEATER_ARM=reads|always` says when the tier arms
-//! it (`reads`: after a segment that read from disk; `always`: at every cut
-//! wait and every fire tail). `PIE_METAL_HEATER_KERNEL=mem|alu` picks the
+//! `PIE_METAL_HEATER=on` turns it on as the ALU kernel at every gap, the
+//! setting measured best below; `PIE_METAL_HEATER=<MiB>` asks for the scale
+//! kernel of that size, armed after a read (`0` or `off` for the default,
+//! off). `PIE_METAL_HEATER_INFLIGHT` says how many are queued ahead (2).
+//! `PIE_METAL_HEATER_ARM=reads|always` says when the tier arms it (`reads`:
+//! after a segment that read from disk; `always`: at every cut wait and
+//! every fire tail). `PIE_METAL_HEATER_KERNEL=mem|alu` picks the
 //! kernel: `mem` scales the buffer (`x = 0.999 x + 1`, bandwidth-bound,
 //! wide); `alu` runs `PIE_METAL_HEATER_ALU_THREADS` (1024) threads through
 //! `PIE_METAL_HEATER_ALU_ITERS` (8192) dependent FMAs each — narrow and
@@ -115,11 +117,11 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 /// `PIE_METAL_HEATER` means.
 #[must_use]
 pub(crate) fn wanted() -> Option<Config> {
-    let mib = match std::env::var(ENV) {
+    let (mib, on_word) = match std::env::var(ENV) {
         Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
             "0" | "off" | "false" | "no" => return None,
-            "on" | "auto" => DEFAULT_MIB,
-            other => other.parse::<u64>().ok().filter(|&n| n > 0)?,
+            "on" | "auto" => (DEFAULT_MIB, true),
+            other => (other.parse::<u64>().ok().filter(|&n| n > 0)?, false),
         },
         Err(_) => return None,
     };
@@ -132,20 +134,29 @@ pub(crate) fn wanted() -> Option<Config> {
     let inflight = number(INFLIGHT_ENV).map_or(DEFAULT_INFLIGHT, |n| n as usize);
     let threads = number(ALU_THREADS_ENV).unwrap_or(DEFAULT_ALU_THREADS);
     let iters = number(ALU_ITERS_ENV).map_or(DEFAULT_ALU_ITERS, |n| n.min(u64::from(u32::MAX)) as u32);
+    // `on` is the setting the step-model effort settled on (issue 02 of
+    // .scratch/decode-step-model): the narrow ALU kernel at every gap holds
+    // the cut frames at 29.7 ms with no misses and 31.5 at 331, where the
+    // 16 MiB scale after a read held 30.1 and 43.4. A MiB count still asks
+    // for the scale kernel, and `_KERNEL` / `_ARM` say otherwise explicitly.
     let kernel = match std::env::var(KERNEL_ENV)
         .map(|word| word.trim().to_ascii_lowercase())
         .as_deref()
     {
         Ok("alu") => Kernel::Alu { threads, iters },
         Ok("spin") => Kernel::Spin { threads, iters },
+        Ok("mem") => Kernel::Mem { mib },
+        _ if on_word => Kernel::Alu { threads, iters },
         _ => Kernel::Mem { mib },
     };
-    let always = matches!(
-        std::env::var(ARM_ENV)
-            .map(|word| word.trim().to_ascii_lowercase())
-            .as_deref(),
-        Ok("always")
-    );
+    let always = match std::env::var(ARM_ENV)
+        .map(|word| word.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("always") => true,
+        Ok("reads") => false,
+        _ => on_word,
+    };
     Some(Config {
         kernel,
         inflight,
