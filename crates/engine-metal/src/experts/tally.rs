@@ -94,8 +94,8 @@ pub struct FireRecord {
     pub walk_ms: f64,
     /// Device time of this fire's cut frames (every frame but the last).
     pub gpu_cut_ms: f64,
-    /// Device time of final frames that landed since the previous record:
-    /// the fire before this one, in steady decode.
+    /// Device time of final frames that landed since the previous record
+    /// closed: the fire before this one, in steady decode.
     pub gpu_tail_ms: f64,
     /// Wall clock as this fire opened, ms since the load's first fire. The
     /// step a decode takes is the gap between two of these, which is the
@@ -189,11 +189,24 @@ pub(super) fn log_cut(record: &CutRecord) {
         record.gpu_ms,
         record.cut_ms,
     );
-    let _ = file.flush();
+    // Flushed with the fire's own record, not here: a flush a cut was 48
+    // syscalls a step in the measured window.
+}
+
+/// Push the cut rows of a fire to disk beside its record.
+fn flush_cuts() {
+    use std::io::Write;
+    if let Some(log) = CUTS.get().and_then(Option::as_ref) {
+        let _ = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush();
+    }
 }
 
 pub fn log_fire(record: &FireRecord) {
     use std::io::Write;
+    flush_cuts();
     let Some(log) = fire_log() else {
         return;
     };
@@ -287,10 +300,12 @@ impl Tally {
         }
     }
 
-    /// A fire opens: what it does is what these counters move by, and when
-    /// it opened is what says how long the one before it took.
+    /// A fire opens: when it opened is what says how long the one before it
+    /// took. The counters' mark stays where the last close left it, so a
+    /// final frame that lands between one fire's close and the next one's
+    /// open — the readout's wait — is counted by the record that follows,
+    /// rather than by none.
     pub(super) fn open(&mut self) {
-        self.at = self.mark();
         self.at_ms = self
             .first
             .get_or_insert_with(std::time::Instant::now)

@@ -39,7 +39,10 @@
 //! wide); `alu` runs `PIE_METAL_HEATER_ALU_THREADS` (1024) threads through
 //! `PIE_METAL_HEATER_ALU_ITERS` (8192) dependent FMAs each — narrow and
 //! compute-bound, so the device is never idle yet a kernel still in flight
-//! when a frame commits takes a sliver of it. `PIE_METAL_HEATER_LOG=<path>`
+//! when a frame commits takes a sliver of it; `spin` is the same chain but
+//! one dispatch an armed window, polling a flag the host clears at `pause()`
+//! (`_ALU_ITERS` chunks of 256 at most), so the host commits almost nothing
+//! and a short kernel does not have to be a frequent one. `PIE_METAL_HEATER_LOG=<path>`
 //! appends one line per armed window: when it opened, how many kernels ran,
 //! their summed and mean device time — fixed work, so the mean is a direct
 //! reading of the clock in the gaps.
@@ -67,6 +70,11 @@ pub enum Kernel {
     /// This many threads, each through this many dependent FMAs: narrow and
     /// compute-bound.
     Alu { threads: u64, iters: u32 },
+    /// This many threads spinning on FMAs until the host clears a flag or
+    /// `iters` chunks of 256 have passed: one dispatch an armed window, so
+    /// the host commits almost nothing and a frame waits on nothing longer
+    /// than one chunk.
+    Spin { threads: u64, iters: u32 },
 }
 
 /// Everything the environment says about the heater.
@@ -85,6 +93,20 @@ struct Shared {
     always: bool,
     lock: Mutex<()>,
     wake: Condvar,
+    /// The spin kernel's flag, in a shared buffer: 1 while it should keep
+    /// spinning, 0 to make it return. Null for the other kernels.
+    flag: std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU32>,
+}
+
+impl Shared {
+    fn flag(&self, value: u32) {
+        let flag = self.flag.load(Ordering::Acquire);
+        if !flag.is_null() {
+            // SAFETY: the pointer names the first word of the heater's own
+            // shared buffer, which the kit keeps alive for the thread's life.
+            unsafe { (*flag).store(value, Ordering::Release) };
+        }
+    }
 }
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
@@ -108,14 +130,14 @@ pub(crate) fn wanted() -> Option<Config> {
             .filter(|&n| n > 0)
     };
     let inflight = number(INFLIGHT_ENV).map_or(DEFAULT_INFLIGHT, |n| n as usize);
+    let threads = number(ALU_THREADS_ENV).unwrap_or(DEFAULT_ALU_THREADS);
+    let iters = number(ALU_ITERS_ENV).map_or(DEFAULT_ALU_ITERS, |n| n.min(u64::from(u32::MAX)) as u32);
     let kernel = match std::env::var(KERNEL_ENV)
         .map(|word| word.trim().to_ascii_lowercase())
         .as_deref()
     {
-        Ok("alu") => Kernel::Alu {
-            threads: number(ALU_THREADS_ENV).unwrap_or(DEFAULT_ALU_THREADS),
-            iters: number(ALU_ITERS_ENV).map_or(DEFAULT_ALU_ITERS, |n| n.min(u64::from(u32::MAX)) as u32),
-        },
+        Ok("alu") => Kernel::Alu { threads, iters },
+        Ok("spin") => Kernel::Spin { threads, iters },
         _ => Kernel::Mem { mib },
     };
     let always = matches!(
@@ -137,6 +159,7 @@ pub fn arm() {
     if let Some(shared) = SHARED.get()
         && !shared.armed.swap(true, Ordering::AcqRel)
     {
+        shared.flag(1);
         let _guard = shared
             .lock
             .lock()
@@ -149,6 +172,7 @@ pub fn arm() {
 pub fn pause() {
     if let Some(shared) = SHARED.get() {
         shared.armed.store(false, Ordering::Release);
+        shared.flag(0);
     }
 }
 
@@ -181,11 +205,21 @@ mod apple {
         constant uint& iters [[buffer(1)]], uint i [[thread_position_in_grid]]) { \
         float a = x[i] + 1.0f; float b = a * 0.5f + 1.0f; \
         for (uint k = 0; k < iters; k++) { a = fma(a, 0.999f, b); b = fma(b, 0.998f, a); } \
+        x[i] = a + b; }\n\
+        kernel void pie_heater_spin(device float* x [[buffer(0)]], \
+        constant uint& chunks [[buffer(1)]], device atomic_uint* flag [[buffer(2)]], \
+        uint i [[thread_position_in_grid]]) { \
+        float a = x[i] + 1.0f; float b = a * 0.5f + 1.0f; \
+        for (uint c = 0; c < chunks; c++) { \
+        if (atomic_load_explicit(flag, memory_order_relaxed) == 0) break; \
+        for (uint k = 0; k < 256; k++) { a = fma(a, 0.999f, b); b = fma(b, 0.998f, a); } } \
         x[i] = a + b; }\n";
 
     pub(super) struct Kit {
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
+        /// The spin kernel's flag word, when there is one.
+        flag: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
         pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         elements: usize,
         iters: Option<u32>,
@@ -206,6 +240,15 @@ mod apple {
             let (bytes, entry, iters) = match kernel {
                 Kernel::Mem { mib } => (mib << 20, "pie_heater", None),
                 Kernel::Alu { threads, iters } => (threads * 4, "pie_heater_alu", Some(iters)),
+                Kernel::Spin { threads, iters } => (threads * 4, "pie_heater_spin", Some(iters)),
+            };
+            let flag = match kernel {
+                Kernel::Spin { .. } => Some(
+                    device
+                        .newBufferWithLength_options(4, MTLResourceOptions::StorageModeShared)
+                        .ok_or_else(|| "the device declined 4 bytes for the heater's flag".to_string())?,
+                ),
+                _ => None,
             };
             let bytes = usize::try_from(bytes).map_err(|_| "too many bytes".to_string())?;
             let buffer = device
@@ -225,10 +268,19 @@ mod apple {
             Ok(Kit {
                 queue,
                 buffer,
+                flag,
                 pipeline,
                 elements: bytes / 4,
                 iters,
             })
+        }
+
+        /// The flag word of the spin kernel, host-writable, or null.
+        pub(super) fn flag_word(&self) -> *mut std::sync::atomic::AtomicU32 {
+            match &self.flag {
+                Some(flag) => flag.contents().as_ptr().cast(),
+                None => std::ptr::null_mut(),
+            }
         }
 
         /// One kernel, committed. Returns the command buffer to wait on.
@@ -248,6 +300,9 @@ mod apple {
                         std::mem::size_of::<u32>(),
                         1,
                     );
+                }
+                if let Some(flag) = &self.flag {
+                    encoder.setBuffer_offset_atIndex(Some(flag), 0, 2);
                 }
             }
             encoder.dispatchThreads_threadsPerThreadgroup(
@@ -368,6 +423,7 @@ pub fn start(device: &super::Context, wanted: Option<Config>) -> String {
             always: config.always,
             lock: Mutex::new(()),
             wake: Condvar::new(),
+            flag: std::sync::atomic::AtomicPtr::new(kit.flag_word()),
         });
         let worker = Arc::clone(&shared);
         let inflight = config.inflight;
@@ -380,6 +436,9 @@ pub fn start(device: &super::Context, wanted: Option<Config>) -> String {
                 let what = match config.kernel {
                     Kernel::Mem { mib } => format!("{mib} MiB scale"),
                     Kernel::Alu { threads, iters } => format!("{threads} threads x {iters} FMAs"),
+                    Kernel::Spin { threads, iters } => {
+                        format!("{threads} threads spinning up to {iters} x 256 FMAs")
+                    }
                 };
                 format!(
                     "heater on: {what} x {inflight} in flight, armed {}{}",

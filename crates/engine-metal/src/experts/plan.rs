@@ -44,6 +44,84 @@ pub const COLD_ENV: &str = "PIE_EXPERT_CACHE_COLD";
 
 pub const CUT_LOG_ENV: &str = "PIE_EXPERT_CACHE_CUT_LOG";
 
+pub const FORCE_MISS_ENV: &str = "PIE_EXPERT_CACHE_FORCE_MISS";
+
+/// Which layers `PIE_EXPERT_CACHE_FORCE_MISS` names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layers {
+    All,
+    /// Every `n`th layer from 0.
+    Every(u32),
+    /// The layers listed, ranges expanded.
+    These(BTreeSet<u32>),
+}
+
+impl Layers {
+    #[must_use]
+    pub fn includes(&self, layer: u32) -> bool {
+        match self {
+            Layers::All => true,
+            Layers::Every(n) => layer.is_multiple_of(*n),
+            Layers::These(set) => set.contains(&layer),
+        }
+    }
+}
+
+/// `PIE_EXPERT_CACHE_FORCE_MISS=<layers>:<k>`: in each named layer, the first
+/// `k` distinct experts a decode segment routes to are read from disk again
+/// whether or not they sit in the pool. For measuring what a read call
+/// costs at a known number of layers and misses; it changes no result, only
+/// where the bytes come from. `<layers>` is `all`, `every:<n>`, or a comma
+/// list of layers and `lo-hi` ranges.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForceMiss {
+    pub layers: Layers,
+    pub k: u32,
+}
+
+impl ForceMiss {
+    fn parse(word: &str) -> Result<ForceMiss> {
+        let wrong = || {
+            Fault::Residency(format!(
+                "`{FORCE_MISS_ENV}={word}` is not `<layers>:<k>`; write `all:1`, `every:4:10`, \
+                 or `0-11,24:2`"
+            ))
+        };
+        let (layers, k) = word.trim().rsplit_once(':').ok_or_else(wrong)?;
+        let k = k.trim().parse::<u32>().ok().filter(|&k| k > 0).ok_or_else(wrong)?;
+        let layers = match layers.trim().to_ascii_lowercase() {
+            ref all if all == "all" => Layers::All,
+            ref every if every.starts_with("every:") => Layers::Every(
+                every["every:".len()..]
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(wrong)?,
+            ),
+            list => {
+                let mut set = BTreeSet::new();
+                for piece in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    match piece.split_once('-') {
+                        Some((lo, hi)) => {
+                            let lo = lo.trim().parse::<u32>().map_err(|_| wrong())?;
+                            let hi = hi.trim().parse::<u32>().map_err(|_| wrong())?;
+                            set.extend(lo..=hi);
+                        }
+                        None => {
+                            set.insert(piece.parse::<u32>().map_err(|_| wrong())?);
+                        }
+                    }
+                }
+                if set.is_empty() {
+                    return Err(wrong());
+                }
+                Layers::These(set)
+            }
+        };
+        Ok(ForceMiss { layers, k })
+    }
+}
+
 /// A row routes to `top_k` of `experts`, so `rows` rows name about
 /// `experts * (1 - exp(-rows * top_k / experts))` distinct experts: the
 /// union passes 80% of the layer at `rows = 1.6 * experts / top_k`. Below
@@ -82,6 +160,8 @@ pub struct Knobs {
     /// `PIE_EXPERT_CACHE_COLD`: every prefill starts from an empty pool, so
     /// a bench repeats a cold measurement without restarting the server.
     pub(super) cold: bool,
+    /// `PIE_EXPERT_CACHE_FORCE_MISS`: misses planted in named layers.
+    pub(super) force_miss: Option<ForceMiss>,
 }
 
 impl Default for Knobs {
@@ -119,6 +199,10 @@ impl Knobs {
                 std::env::var(COLD_ENV).as_deref().map(str::trim),
                 Ok("1" | "on" | "true" | "yes")
             ),
+            force_miss: match std::env::var(FORCE_MISS_ENV) {
+                Ok(word) if !word.trim().is_empty() => Some(ForceMiss::parse(&word)?),
+                _ => None,
+            },
         })
     }
 
@@ -136,6 +220,7 @@ impl Knobs {
             heater: None,
             cpu_heater: false,
             cold: false,
+            force_miss: None,
         }
     }
 
@@ -680,6 +765,12 @@ impl Plan {
         self.knobs.cold
     }
 
+    /// Misses planted in named layers, if the load asked for any.
+    #[must_use]
+    pub fn force_miss(&self) -> Option<&ForceMiss> {
+        self.knobs.force_miss.as_ref()
+    }
+
     #[must_use]
     pub fn prefill_min(&self) -> u32 {
         self.prefill_min
@@ -757,6 +848,22 @@ mod tests {
         assert_eq!(parse_bytes("1024"), Some(1024));
         assert_eq!(parse_bytes("1.5GiB"), Some(3 << 29));
         assert_eq!(parse_bytes("lots"), None);
+    }
+
+    #[test]
+    fn force_miss_parses() {
+        let got = ForceMiss::parse("all:1").unwrap();
+        assert_eq!(got.k, 1);
+        assert!(got.layers.includes(47));
+        let got = ForceMiss::parse("every:4:10").unwrap();
+        assert_eq!(got.k, 10);
+        assert!(got.layers.includes(0) && got.layers.includes(44) && !got.layers.includes(2));
+        let got = ForceMiss::parse(" 0-2, 24 :3").unwrap();
+        assert_eq!(got.k, 3);
+        assert!(got.layers.includes(1) && got.layers.includes(24) && !got.layers.includes(3));
+        assert!(ForceMiss::parse("all").is_err());
+        assert!(ForceMiss::parse("all:0").is_err());
+        assert!(ForceMiss::parse("x-y:1").is_err());
     }
 
     #[test]

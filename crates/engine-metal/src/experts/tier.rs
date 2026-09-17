@@ -84,6 +84,9 @@ pub struct Tier {
     prefetch_k: usize,
     blocked: bool,
     dump: Option<std::io::BufWriter<std::fs::File>>,
+    /// Per group, how many of a decode segment's distinct experts are read
+    /// again whatever the pool holds (`PIE_EXPERT_CACHE_FORCE_MISS`).
+    forced: Vec<u32>,
 }
 
 const PREFETCH_K: usize = 4;
@@ -171,6 +174,13 @@ impl Tier {
             prefill_min: if plan.ring > 0 { plan.prefill_min } else { 0 },
             whole: false,
             cold: plan.cold(),
+            forced: (0..plan.groups.len() as u32)
+                .map(|at| {
+                    plan.force_miss()
+                        .filter(|force| force.layers.includes(at))
+                        .map_or(0, |force| force.k)
+                })
+                .collect(),
         };
         for (at, group) in plan.groups.iter().enumerate() {
             let bands = group
@@ -581,6 +591,10 @@ impl Tier {
     fn decide(&mut self, at: usize, raw: &[u8]) -> Result<Seating> {
         let mut seating = Seating::default();
         let mut taken: BTreeMap<u32, u32> = BTreeMap::new();
+        // Planted misses: the first `forced` distinct experts this segment
+        // names are read again into a fresh seat; `assign` then strips the
+        // seat they held, so the pool's occupancy does not change.
+        let mut forced = self.forced.get(at).copied().unwrap_or(0);
         for entry in raw.as_chunks::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
@@ -600,13 +614,16 @@ impl Tier {
                 self.pool.bump(seat);
                 continue;
             }
-            if let Some(seat) = self.groups[at].seat_of[expert as usize] {
+            if forced == 0
+                && let Some(seat) = self.groups[at].seat_of[expert as usize]
+            {
                 self.tally.hits += 1;
                 self.pool.bump(seat);
                 self.pool.hold(seat, Hold::Segment);
                 taken.insert(expert, seat);
                 continue;
             }
+            forced = forced.saturating_sub(1);
             self.tally.misses += 1;
             let seat = self.take(at)?;
             self.pool.hold(seat, Hold::Segment);
