@@ -6,9 +6,11 @@
 //! each a wait on the host while it seats a layer's experts. llama.cpp's
 //! expert store measured the kernels of a step running 20% slower under it
 //! and took the whole loss back with a 16 MiB scale kernel kept in flight on
-//! its own queue during the gaps (`TAG_METAL_HEATER`). This is that: armed
-//! when a cut's wait returns and when a fire's last frame lands, paused at
-//! every commit, off unless a tier is open.
+//! its own queue during the gaps (`TAG_METAL_HEATER`). This is that. The
+//! tier says when: it arms this as a cut's wait returns and as a fire's last
+//! frame lands, and only when the segment before read from disk, which is
+//! the pool's own knowledge and no one else's. A frame pauses it as it
+//! commits, because real work reaching the queue is the device's business.
 //!
 //! Measured on Qwen3.6-35B-A3B at 40 cuts a step: with a pool that misses
 //! 244 times a step (85 ms of reads), it takes the step from 119 to 112 ms

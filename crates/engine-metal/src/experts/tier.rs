@@ -991,23 +991,29 @@ impl Tier {
         (self.tally.swaps, self.tally.segments)
     }
 
+    /// The device is idle until the next commit. If the last segment read
+    /// from disk this one probably will too, and the wait is long enough
+    /// that the clock falls: hold it up. If it did not, the gap is tens of
+    /// microseconds and a heater kernel would only be in the way.
+    fn heat(&self) {
+        if self.blocked {
+            crate::device::heater::arm();
+        }
+    }
+
+    /// A cut waited this long on the device.
     pub fn note_wait(&mut self, ns: u64) {
         self.tally.wait_ns += ns;
+        self.heat();
     }
 
-    /// Whether the last segment read from disk, so the next cut's host phase
-    /// is likely to be long. The heater asks before it fires.
-    #[must_use]
-    pub fn blocking(&self) -> bool {
-        self.blocked
-    }
-
-    /// Device time of a cut frame, as the command buffer reports it.
     /// Device time of the fire's final frame, as it lands.
     pub fn note_tail(&mut self, ns: u64) {
         self.tally.tail_ns += ns;
+        self.heat();
     }
 
+    /// Device time of a cut frame, as the command buffer reports it.
     pub fn note_gpu(&mut self, ns: u64) {
         self.tally.gpu_ns += ns;
     }

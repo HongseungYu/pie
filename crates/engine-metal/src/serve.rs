@@ -1514,15 +1514,6 @@ impl Shell {
             tier.borrow_mut()
                 .note_tail(end.saturating_sub(start) * 1000);
         }
-        if self
-            .weights
-            .tier()
-            .is_some_and(|tier| tier.borrow().blocking())
-        {
-            // Between this fire's last frame and the next fire's first, the
-            // device idles: keep its clock up.
-            crate::device::heater::arm();
-        }
         fire_trace(|| {
             let (start, end) = flight.pending.gpu_span_us();
             format!(
