@@ -115,3 +115,52 @@ the effect the `clean` mode's tail figure was trying to see and could not.
 A step's spread is wide (p10 to p90 is 57 ms at 4000 seats) because a step's
 cost is its miss count, so quote the median with the quantiles, not a mean
 alone.
+
+## Repeating a cold request without restarting the server
+
+`PIE_EXPERT_CACHE_COLD=1` (engine commit 699e2f87) drops every expert the
+pool holds as a prefill opens, so `--reps` repeats the same cold request.
+Verified at 4000 seats, a 256-token prompt, 512 teacher-forced tokens,
+three reps in one server:
+
+| rep | wall | decode hit | last 256: mean | median | misses/step | read |
+|---|---|---|---|---|---|---|
+| 0 | 69.2 s | 0.7014 | 122.81 ms | 123.03 | 153.5 | 101.2 GiB |
+| 1 | 69.3 s | 0.7014 | 122.96 ms | 123.08 | 153.5 | 101.2 GiB |
+| 2 | 71.3 s | 0.7014 | 123.02 ms | 122.59 | 153.5 | 101.2 GiB |
+
+Hit rate, misses a step and bytes read are identical to the digit across
+all three: the requests walked the same cache trajectory, which is what
+the clean is for. Step time agrees inside 0.2%.
+
+With the knob off the same three reps ran 71.7 / 79.1 / 84.0 s and their
+step distributions came apart (the fit's r2 fell 0.960 -> 0.221 -> 0.228).
+That is not a clean control, though: the off run followed the on run, so
+the drive and the SoC had already been working for four minutes. What the
+pair does show is that the knob delivers repeatability, not that its
+absence costs 15%.
+
+Note the steady state is the same either way: the last 256 steps hold
+0.680 of their routes whichever way the knob is set. At 4000 seats over
+24576 (layer, expert) pairs the starting cache washes out; the clean's
+worth is that the whole trajectory, early steps included, repeats.
+
+## Seats against the step
+
+One cold request each (fresh server, 1k prompt, 1024 teacher-forced
+tokens, heater on), last 512 steps:
+
+| seats | memory | step ms (median) | tok/s | hit rate | misses/step | read ms/step | ms a miss (measured) | ms a miss (fitted) | step at no misses |
+|---|---|---|---|---|---|---|---|---|---|
+| 1536 | 3.96 GiB | 167.82 | 5.96 | 0.451 | 263.7 | 112.51 (66.9%) | 0.427 | 0.365 | 72.13 |
+| 3072 | 7.91 GiB | 129.42 | 7.73 | 0.639 | 173.2 | 76.78 (58.6%) | 0.443 | 0.403 | 61.31 |
+| 4000 | 10.30 GiB | 116.06 | 8.62 | 0.705 | 141.7 | 64.29 (54.6%) | 0.454 | 0.417 | 58.64 |
+| 5024 | 12.94 GiB | 105.96 | 9.44 | 0.754 | 118.2 | 55.24 (51.3%) | 0.468 | 0.432 | 56.70 |
+| 6144 | 15.82 GiB | 97.46 | 10.26 | 0.799 | 96.3 | 46.96 (47.6%) | 0.488 | 0.455 | 54.84 |
+
+A miss costs 0.43-0.49 ms whatever the pool size (2.637 MiB an expert, so
+about 0.17 ms a MiB), and the step with no misses falls slowly from 72 to
+55 ms as the pool grows, which is the cut's own bookkeeping thinning out.
+Everything else is the miss count: seats buy hit rate, hit rate buys time,
+and the return per seat is falling — the first 1536 seats past the floor
+take 38 ms off a step, the last 1120 take 8.
