@@ -483,6 +483,10 @@ impl Shell {
                 "engine-metal: {}",
                 crate::device::heater::start(&device, boot.residency.heater())
             );
+            eprintln!(
+                "engine-metal: {}",
+                crate::device::spinner::start(boot.residency.cpu_heater())
+            );
         }
 
         {

@@ -8,9 +8,10 @@
 //! and took the whole loss back with a 16 MiB scale kernel kept in flight on
 //! its own queue during the gaps (`TAG_METAL_HEATER`). This is that. The
 //! tier says when: it arms this as a cut's wait returns and as a fire's last
-//! frame lands, and only when the segment before read from disk, which is
-//! the pool's own knowledge and no one else's. A frame pauses it as it
-//! commits, because real work reaching the queue is the device's business.
+//! frame lands, and — under the `reads` policy — only when the segment
+//! before read from disk, which is the pool's own knowledge and no one
+//! else's. A frame pauses it as it commits, because real work reaching the
+//! queue is the device's business.
 //!
 //! Measured on Qwen3.6-35B-A3B at 40 cuts a step: with a pool that misses
 //! 244 times a step (85 ms of reads), it takes the step from 119 to 112 ms
@@ -20,31 +21,78 @@
 //! doubles. So it is off unless asked for, and even then it only fires when
 //! the last segment read from disk.
 //!
+//! On Qwen3.8-Flash-Next (48 cuts a step) that was not enough: the frames'
+//! device time still climbed from 30.6 ms at no misses to 43 ms at 264,
+//! heater on. Two things the `reads` rule leaves out: the ~9 ms gap between
+//! one fire's last frame and the next fire's first, which arms nothing
+//! unless layer 47 happened to read; and the two 16 MiB kernels in flight
+//! at `pause()`, which run beside the real frame (~0.25 ms a missing
+//! layer). Hence the knobs below, so the policy and the kernel's shape can
+//! be swept without a rebuild.
+//!
 //! `PIE_METAL_HEATER=<MiB>` turns it on (`on` for 16 MiB; `0` or `off` for
 //! the default, off), `PIE_METAL_HEATER_INFLIGHT` how many are queued
-//! ahead (2).
+//! ahead (2). `PIE_METAL_HEATER_ARM=reads|always` says when the tier arms
+//! it (`reads`: after a segment that read from disk; `always`: at every cut
+//! wait and every fire tail). `PIE_METAL_HEATER_KERNEL=mem|alu` picks the
+//! kernel: `mem` scales the buffer (`x = 0.999 x + 1`, bandwidth-bound,
+//! wide); `alu` runs `PIE_METAL_HEATER_ALU_THREADS` (1024) threads through
+//! `PIE_METAL_HEATER_ALU_ITERS` (8192) dependent FMAs each — narrow and
+//! compute-bound, so the device is never idle yet a kernel still in flight
+//! when a frame commits takes a sliver of it. `PIE_METAL_HEATER_LOG=<path>`
+//! appends one line per armed window: when it opened, how many kernels ran,
+//! their summed and mean device time — fixed work, so the mean is a direct
+//! reading of the clock in the gaps.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 pub const ENV: &str = "PIE_METAL_HEATER";
 pub const INFLIGHT_ENV: &str = "PIE_METAL_HEATER_INFLIGHT";
+pub const ARM_ENV: &str = "PIE_METAL_HEATER_ARM";
+pub const KERNEL_ENV: &str = "PIE_METAL_HEATER_KERNEL";
+pub const ALU_THREADS_ENV: &str = "PIE_METAL_HEATER_ALU_THREADS";
+pub const ALU_ITERS_ENV: &str = "PIE_METAL_HEATER_ALU_ITERS";
+pub const LOG_ENV: &str = "PIE_METAL_HEATER_LOG";
 const DEFAULT_MIB: u64 = 16;
 const DEFAULT_INFLIGHT: usize = 2;
+const DEFAULT_ALU_THREADS: u64 = 1024;
+const DEFAULT_ALU_ITERS: u32 = 8192;
+
+/// What the heater kernel does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kernel {
+    /// Scale a buffer of this many MiB: wide and bandwidth-bound.
+    Mem { mib: u64 },
+    /// This many threads, each through this many dependent FMAs: narrow and
+    /// compute-bound.
+    Alu { threads: u64, iters: u32 },
+}
+
+/// Everything the environment says about the heater.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub kernel: Kernel,
+    pub inflight: usize,
+    /// Arm at every cut wait and fire tail, not only after a disk read.
+    pub always: bool,
+    pub log: Option<std::path::PathBuf>,
+}
 
 struct Shared {
     armed: AtomicBool,
     stop: AtomicBool,
+    always: bool,
     lock: Mutex<()>,
     wake: Condvar,
 }
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 
-/// What the environment asks for: `(MiB, in flight)`, or `None` for off,
-/// which is what an unset `PIE_METAL_HEATER` means.
+/// What the environment asks for, or `None` for off, which is what an unset
+/// `PIE_METAL_HEATER` means.
 #[must_use]
-pub(crate) fn wanted() -> Option<(u64, usize)> {
+pub(crate) fn wanted() -> Option<Config> {
     let mib = match std::env::var(ENV) {
         Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
             "0" | "off" | "false" | "no" => return None,
@@ -53,12 +101,35 @@ pub(crate) fn wanted() -> Option<(u64, usize)> {
         },
         Err(_) => return None,
     };
-    let inflight = std::env::var(INFLIGHT_ENV)
-        .ok()
-        .and_then(|word| word.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(DEFAULT_INFLIGHT);
-    Some((mib, inflight))
+    let number = |env: &str| {
+        std::env::var(env)
+            .ok()
+            .and_then(|word| word.trim().parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    };
+    let inflight = number(INFLIGHT_ENV).map_or(DEFAULT_INFLIGHT, |n| n as usize);
+    let kernel = match std::env::var(KERNEL_ENV)
+        .map(|word| word.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Ok("alu") => Kernel::Alu {
+            threads: number(ALU_THREADS_ENV).unwrap_or(DEFAULT_ALU_THREADS),
+            iters: number(ALU_ITERS_ENV).map_or(DEFAULT_ALU_ITERS, |n| n.min(u64::from(u32::MAX)) as u32),
+        },
+        _ => Kernel::Mem { mib },
+    };
+    let always = matches!(
+        std::env::var(ARM_ENV)
+            .map(|word| word.trim().to_ascii_lowercase())
+            .as_deref(),
+        Ok("always")
+    );
+    Some(Config {
+        kernel,
+        inflight,
+        always,
+        log: std::env::var_os(LOG_ENV).map(std::path::PathBuf::from),
+    })
 }
 
 /// Let the heater run until the next commit.
@@ -86,6 +157,12 @@ pub fn running() -> bool {
     SHARED.get().is_some()
 }
 
+/// Whether the tier should arm this at every gap, not only after a read.
+#[must_use]
+pub fn always() -> bool {
+    SHARED.get().is_some_and(|shared| shared.always)
+}
+
 #[cfg(target_vendor = "apple")]
 mod apple {
     use super::*;
@@ -99,13 +176,19 @@ mod apple {
     const SOURCE: &str = "#include <metal_stdlib>\n\
         using namespace metal;\n\
         kernel void pie_heater(device float* x [[buffer(0)]], \
-        uint i [[thread_position_in_grid]]) { x[i] = x[i] * 0.999f + 1.0f; }\n";
+        uint i [[thread_position_in_grid]]) { x[i] = x[i] * 0.999f + 1.0f; }\n\
+        kernel void pie_heater_alu(device float* x [[buffer(0)]], \
+        constant uint& iters [[buffer(1)]], uint i [[thread_position_in_grid]]) { \
+        float a = x[i] + 1.0f; float b = a * 0.5f + 1.0f; \
+        for (uint k = 0; k < iters; k++) { a = fma(a, 0.999f, b); b = fma(b, 0.998f, a); } \
+        x[i] = a + b; }\n";
 
     pub(super) struct Kit {
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
         buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
         pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
         elements: usize,
+        iters: Option<u32>,
     }
 
     // SAFETY: the queue, buffer and pipeline are used from the heater thread
@@ -115,20 +198,24 @@ mod apple {
     impl Kit {
         pub(super) fn open(
             device: &ProtocolObject<dyn MTLDevice>,
-            mib: u64,
+            kernel: Kernel,
         ) -> std::result::Result<Kit, String> {
             let queue = device
                 .newCommandQueue()
                 .ok_or_else(|| "the device would not open a second command queue".to_string())?;
-            let bytes = usize::try_from(mib << 20).map_err(|_| "too many MiB".to_string())?;
+            let (bytes, entry, iters) = match kernel {
+                Kernel::Mem { mib } => (mib << 20, "pie_heater", None),
+                Kernel::Alu { threads, iters } => (threads * 4, "pie_heater_alu", Some(iters)),
+            };
+            let bytes = usize::try_from(bytes).map_err(|_| "too many bytes".to_string())?;
             let buffer = device
                 .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
-                .ok_or_else(|| format!("the device declined {mib} MiB for the heater"))?;
+                .ok_or_else(|| format!("the device declined {bytes} bytes for the heater"))?;
             let source = crate::device::ctx::nsstring(SOURCE);
             let library = device
                 .newLibraryWithSource_options_error(&source, None)
                 .map_err(|error| error.localizedDescription().to_string())?;
-            let name = crate::device::ctx::nsstring("pie_heater");
+            let name = crate::device::ctx::nsstring(entry);
             let function = library
                 .newFunctionWithName(&name)
                 .ok_or_else(|| "the heater kernel did not compile to an entrypoint".to_string())?;
@@ -140,6 +227,7 @@ mod apple {
                 buffer,
                 pipeline,
                 elements: bytes / 4,
+                iters,
             })
         }
 
@@ -149,9 +237,18 @@ mod apple {
             let encoder = buffer.computeCommandEncoder()?;
             encoder.setComputePipelineState(&self.pipeline);
             // SAFETY: a live buffer bound at index 0, which the kernel reads
-            // and writes within its own length.
+            // and writes within its own length; the iteration count is a
+            // 4-byte constant copied at encode time.
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&self.buffer), 0, 0);
+                if let Some(iters) = self.iters {
+                    let iters: u32 = iters;
+                    encoder.setBytes_length_atIndex(
+                        std::ptr::NonNull::from(&iters).cast(),
+                        std::mem::size_of::<u32>(),
+                        1,
+                    );
+                }
             }
             encoder.dispatchThreads_threadsPerThreadgroup(
                 MTLSize {
@@ -160,7 +257,7 @@ mod apple {
                     depth: 1,
                 },
                 MTLSize {
-                    width: 256,
+                    width: self.elements.min(256),
                     height: 1,
                     depth: 1,
                 },
@@ -171,7 +268,19 @@ mod apple {
         }
     }
 
-    pub(super) fn run(kit: Kit, shared: Arc<Shared>, inflight: usize) {
+    /// Device time of a completed command buffer, in milliseconds.
+    fn span_ms(buffer: &ProtocolObject<dyn MTLCommandBuffer>) -> f64 {
+        (buffer.GPUEndTime() - buffer.GPUStartTime()) * 1e3
+    }
+
+    pub(super) fn run(
+        kit: Kit,
+        shared: Arc<Shared>,
+        inflight: usize,
+        mut log: Option<std::io::BufWriter<std::fs::File>>,
+    ) {
+        use std::io::Write;
+        let began = std::time::Instant::now();
         loop {
             {
                 let mut guard = shared
@@ -189,6 +298,15 @@ mod apple {
             if shared.stop.load(Ordering::Acquire) {
                 return;
             }
+            let opened = began.elapsed().as_secs_f64() * 1e3;
+            let (mut kernels, mut busy, mut least, mut most) = (0u64, 0.0f64, f64::MAX, 0.0f64);
+            let mut note = |buffer: &ProtocolObject<dyn MTLCommandBuffer>| {
+                let ms = span_ms(buffer);
+                kernels += 1;
+                busy += ms;
+                least = least.min(ms);
+                most = most.max(ms);
+            };
             let mut queued: std::collections::VecDeque<_> =
                 std::collections::VecDeque::with_capacity(inflight);
             while shared.armed.load(Ordering::Acquire) && !shared.stop.load(Ordering::Acquire) {
@@ -203,18 +321,30 @@ mod apple {
                 }
                 if let Some(buffer) = queued.pop_front() {
                     buffer.waitUntilCompleted();
+                    note(&buffer);
                 }
             }
             for buffer in queued.drain(..) {
                 buffer.waitUntilCompleted();
+                note(&buffer);
+            }
+            if let Some(log) = log.as_mut()
+                && kernels > 0
+            {
+                let _ = writeln!(
+                    log,
+                    "{opened:.3},{:.3},{kernels},{busy:.3},{:.4},{least:.4},{most:.4}",
+                    began.elapsed().as_secs_f64() * 1e3,
+                    busy / kernels as f64,
+                );
             }
         }
     }
 }
 
 /// Start the heater thread for this process, once. Says what it did.
-pub fn start(device: &super::Context, wanted: Option<(u64, usize)>) -> String {
-    let Some((mib, inflight)) = wanted else {
+pub fn start(device: &super::Context, wanted: Option<Config>) -> String {
+    let Some(config) = wanted else {
         return format!("heater off (`{ENV}=<MiB>` holds the clock up through long reads)");
     };
     if SHARED.get().is_some() {
@@ -222,31 +352,50 @@ pub fn start(device: &super::Context, wanted: Option<(u64, usize)>) -> String {
     }
     #[cfg(target_vendor = "apple")]
     {
-        let kit = match apple::Kit::open(device.device(), mib) {
+        let kit = match apple::Kit::open(device.device(), config.kernel) {
             Ok(kit) => kit,
             Err(why) => return format!("heater not started: {why}"),
         };
+        let log = config.log.as_ref().and_then(|path| {
+            use std::io::Write;
+            let mut file = std::io::BufWriter::new(std::fs::File::create(path).ok()?);
+            let _ = writeln!(file, "opened_ms,closed_ms,kernels,busy_ms,mean_ms,min_ms,max_ms");
+            Some(file)
+        });
         let shared = Arc::new(Shared {
             armed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            always: config.always,
             lock: Mutex::new(()),
             wake: Condvar::new(),
         });
         let worker = Arc::clone(&shared);
+        let inflight = config.inflight;
         let spawned = std::thread::Builder::new()
             .name("pie-metal-heater".to_string())
-            .spawn(move || apple::run(kit, worker, inflight));
+            .spawn(move || apple::run(kit, worker, inflight, log));
         match spawned {
             Ok(_) => {
                 let _ = SHARED.set(shared);
-                format!("heater on: {mib} MiB x {inflight} in flight during the cuts")
+                let what = match config.kernel {
+                    Kernel::Mem { mib } => format!("{mib} MiB scale"),
+                    Kernel::Alu { threads, iters } => format!("{threads} threads x {iters} FMAs"),
+                };
+                format!(
+                    "heater on: {what} x {inflight} in flight, armed {}{}",
+                    if config.always { "at every gap" } else { "after a read" },
+                    config
+                        .log
+                        .as_ref()
+                        .map_or(String::new(), |path| format!(", logged to {}", path.display())),
+                )
             }
             Err(why) => format!("heater not started: {why}"),
         }
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        let _ = (device, mib, inflight);
+        let _ = (device, config);
         "heater unavailable off Apple".to_string()
     }
 }

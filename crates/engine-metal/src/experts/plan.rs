@@ -74,8 +74,11 @@ pub struct Knobs {
     /// `PIE_EXPERT_CACHE_CUT_LOG`: where the per-cut CSV lands, one row a
     /// layer a fire — what a layer's own misses cost.
     pub(super) cut_log: Option<std::path::PathBuf>,
-    /// `PIE_METAL_HEATER`: the clock heater's `(MiB, in flight)`.
-    pub(super) heater: Option<(u64, usize)>,
+    /// `PIE_METAL_HEATER*`: the clock heater's kernel, depth and arm policy.
+    pub(super) heater: Option<crate::device::heater::Config>,
+    /// `PIE_METAL_CPU_HEATER`: a thread spinning so the host never pays to
+    /// wake up for a read.
+    pub(super) cpu_heater: bool,
     /// `PIE_EXPERT_CACHE_COLD`: every prefill starts from an empty pool, so
     /// a bench repeats a cold measurement without restarting the server.
     pub(super) cold: bool,
@@ -111,6 +114,7 @@ impl Knobs {
             log: std::env::var_os(LOG_ENV).map(std::path::PathBuf::from),
             cut_log: std::env::var_os(CUT_LOG_ENV).map(std::path::PathBuf::from),
             heater: crate::device::heater::wanted(),
+            cpu_heater: crate::device::spinner::wanted(),
             cold: matches!(
                 std::env::var(COLD_ENV).as_deref().map(str::trim),
                 Ok("1" | "on" | "true" | "yes")
@@ -130,6 +134,7 @@ impl Knobs {
             log: None,
             cut_log: None,
             heater: None,
+            cpu_heater: false,
             cold: false,
         }
     }
@@ -657,10 +662,16 @@ impl Plan {
         self.knobs.report_every
     }
 
-    /// The clock heater this load asks for, as `(MiB, in flight)`.
+    /// The clock heater this load asks for.
     #[must_use]
-    pub fn heater(&self) -> Option<(u64, usize)> {
-        self.knobs.heater
+    pub fn heater(&self) -> Option<crate::device::heater::Config> {
+        self.knobs.heater.clone()
+    }
+
+    /// Whether a thread spins to keep the host awake between reads.
+    #[must_use]
+    pub fn cpu_heater(&self) -> bool {
+        self.knobs.cpu_heater
     }
 
     /// Whether every prefill starts from an empty pool.

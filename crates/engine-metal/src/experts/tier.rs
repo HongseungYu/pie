@@ -1018,9 +1018,11 @@ impl Tier {
     /// The device is idle until the next commit. If the last segment read
     /// from disk this one probably will too, and the wait is long enough
     /// that the clock falls: hold it up. If it did not, the gap is tens of
-    /// microseconds and a heater kernel would only be in the way.
+    /// microseconds and a heater kernel would only be in the way — unless
+    /// the heater was asked to cover every gap (`PIE_METAL_HEATER_ARM=always`),
+    /// the fire's tail included, which a narrow kernel can afford.
     fn heat(&self) {
-        if self.blocked {
+        if self.blocked || crate::device::heater::always() {
             crate::device::heater::arm();
         }
     }
