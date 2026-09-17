@@ -40,6 +40,8 @@ pub const PREFILL_ENV: &str = "PIE_EXPERT_CACHE_PREFILL";
 
 pub const REPORT_ENV: &str = "PIE_EXPERT_CACHE_REPORT";
 
+pub const COLD_ENV: &str = "PIE_EXPERT_CACHE_COLD";
+
 /// A row routes to `top_k` of `experts`, so `rows` rows name about
 /// `experts * (1 - exp(-rows * top_k / experts))` distinct experts: the
 /// union passes 80% of the layer at `rows = 1.6 * experts / top_k`. Below
@@ -69,6 +71,9 @@ pub struct Knobs {
     pub(super) log: Option<std::path::PathBuf>,
     /// `PIE_METAL_HEATER`: the clock heater's `(MiB, in flight)`.
     pub(super) heater: Option<(u64, usize)>,
+    /// `PIE_EXPERT_CACHE_COLD`: every prefill starts from an empty pool, so
+    /// a bench repeats a cold measurement without restarting the server.
+    pub(super) cold: bool,
 }
 
 impl Default for Knobs {
@@ -100,6 +105,10 @@ impl Knobs {
                 .unwrap_or(DEFAULT_REPORT_EVERY),
             log: std::env::var_os(LOG_ENV).map(std::path::PathBuf::from),
             heater: crate::device::heater::wanted(),
+            cold: matches!(
+                std::env::var(COLD_ENV).as_deref().map(str::trim),
+                Ok("1" | "on" | "true" | "yes")
+            ),
         })
     }
 
@@ -114,6 +123,7 @@ impl Knobs {
             report_every: DEFAULT_REPORT_EVERY,
             log: None,
             heater: None,
+            cold: false,
         }
     }
 
@@ -644,6 +654,12 @@ impl Plan {
     #[must_use]
     pub fn heater(&self) -> Option<(u64, usize)> {
         self.knobs.heater
+    }
+
+    /// Whether every prefill starts from an empty pool.
+    #[must_use]
+    pub fn cold(&self) -> bool {
+        self.knobs.cold
     }
 
     #[must_use]

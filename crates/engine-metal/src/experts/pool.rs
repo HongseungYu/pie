@@ -160,6 +160,11 @@ impl Pool {
         self.free.push(seat);
     }
 
+    /// Empty: every seat free and unheld, the list as it was at open.
+    pub(super) fn clear(&mut self) {
+        *self = Pool::new(self.slots);
+    }
+
     pub(super) fn resident(&self) -> u64 {
         self.in_seat.iter().filter(|held| held.is_some()).count() as u64
     }

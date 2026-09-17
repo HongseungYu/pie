@@ -68,6 +68,8 @@ pub struct Tier {
     prefill_min: u32,
     /// Whether the fire open now is a prefill one, holding the ring.
     whole: bool,
+    /// Whether a prefill starts from an empty pool (`PIE_EXPERT_CACHE_COLD`).
+    cold: bool,
     per_slot: u64,
     pairs: u64,
     policy: String,
@@ -167,6 +169,7 @@ impl Tier {
             landing: Vec::new(),
             prefill_min: if plan.ring > 0 { plan.prefill_min } else { 0 },
             whole: false,
+            cold: plan.cold(),
         };
         for (at, group) in plan.groups.iter().enumerate() {
             let bands = group
@@ -242,6 +245,9 @@ impl Tier {
             && self.ring.is_some();
         self.whole = whole;
         if whole {
+            if self.cold {
+                self.forget();
+            }
             self.borrow_ring()?;
         }
         self.tally.open();
@@ -318,6 +324,17 @@ impl Tier {
             }
         }
         Ok(())
+    }
+
+    /// Drop every expert the pool holds, so this fire opens where the load
+    /// did. `PIE_EXPERT_CACHE_COLD=1` asks for it, so that a bench can
+    /// repeat a cold measurement without restarting the server: the seats
+    /// this fire borrows are free ones, and its decode fills an empty pool.
+    fn forget(&mut self) {
+        self.pool.clear();
+        for group in &mut self.groups {
+            group.seat_of.fill(None);
+        }
     }
 
     /// Take `2 * experts` seats for this fire's ring: the ones never used
