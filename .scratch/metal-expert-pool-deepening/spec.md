@@ -46,6 +46,8 @@ leverage / locality (codebase-design). Engine terms: tier, pool, seat, group
 | Q18 | Commit order: 01 split -> 02 floor+pass deletion -> 03 knobs -> 04 seat table+kernels -> 05 decide/apply+borrowed ring+holds+fire hooks -> 06 pool/tier split. | 02 must carry the floor with the deletion; 03 before 05 settles `Tier::open`; 04 before 05 keeps the kernel diff separate. |
 | Q19 | Gate per commit: `cargo check/clippy` + `cargo test -p engine-metal --lib`. After 02, 04, 05: one qwen38-profile harness decode (1-2k prefill, 1024 decode, last 512 measured) compared with `scratch/qwen38-profile/RESULTS.md` hit rate and step ms. | 04 changes kernels; 05 should raise hit rate (returned layers). |
 | Q20 | The seat-space fix was committed first (0f1155a6), text-completion separately (4f1f649d); both are removed/kept by later commits with a bisectable history. | |
+| — | **Deviation, issue 04**: the seat table hangs off the weight table, not `kernels_metal::Bank`, because a bf16 expert bank is a `WeightRow::Dense` with no `Bank` and `found` streams those too. ADR-0001 records it. |
+| — | **Deviation, issue 05**: `segment_rows` and `ring_at` were not folded into one function. They share the pool, the holds, the seat table and the fire hooks, but their rhythms differ: one seats what a segment names, the other holds a whole layer filled a layer ahead. `ring_has`/`ring_join`/`ring_ready`/`ring_fill` stay for the same reason. |
 | Q21 | Records live inside `pie/` and are tracked in git: this spec, `issues/`, `adr/0001`, `adr/0002`, all under `.scratch/metal-expert-pool-deepening/`. `/docs/` is gitignored and `.gitignore` stays untouched. | Workspace has no tracker yet. |
 
 ## Facts the decisions rest on

@@ -1,6 +1,6 @@
 # 05 One seating path: decide / apply, borrowed ring, holds, fire hooks
 
-Status: needs-triage
+Status: claimed
 Type: task
 Blocked by: 04
 
