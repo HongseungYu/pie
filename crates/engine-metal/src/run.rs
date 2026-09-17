@@ -18,7 +18,14 @@ pub enum WeightRow {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct WeightTable(pub Vec<Option<WeightRow>>);
+pub struct WeightTable {
+    pub rows: Vec<Option<WeightRow>>,
+
+    /// Where each of a streamed bank's experts sits in the shared pool, one
+    /// table of `experts` seats per row that streams. A resident row has
+    /// none: its experts are their own rows of the bank.
+    pub seats: Vec<Option<Tensor>>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct SlotTable(pub Vec<Option<Tensor>>);
@@ -152,11 +159,6 @@ pub struct Run<'c> {
     copy: CopyPlan,
 
     scratch: &'c Scratch,
-
-    /// The streamed expert tier, when the load has one: its cuts rewrite
-    /// every routing vector to the SEAT an expert was landed in before the
-    /// matmuls run, so it says what id space a vector names.
-    tier: Option<&'c std::cell::RefCell<crate::experts::Tier>>,
 }
 
 impl<'c> Run<'c> {
@@ -174,7 +176,6 @@ impl<'c> Run<'c> {
         windows: &'c Windows,
         place: &'c At,
         scratch: &'c Scratch,
-        tier: Option<&'c std::cell::RefCell<crate::experts::Tier>>,
     ) -> Self {
         Self {
             ctx,
@@ -191,18 +192,7 @@ impl<'c> Run<'c> {
             place,
             copy: CopyPlan::default(),
             scratch,
-            tier,
         }
-    }
-
-    /// The ids a routing vector carries, as `(count, first)`: the router's
-    /// experts from 0 on a resident fire; on a streamed one what the tier
-    /// seated them as (see `Tier::route_ids`).
-    pub(crate) fn route_space(&self, routes: ValueId) -> (u32, u32) {
-        let experts = self.experts(routes);
-        self.tier
-            .and_then(|tier| tier.borrow().route_ids(routes, experts))
-            .unwrap_or((experts, 0))
     }
 
     pub(crate) fn window(&self) -> &'c Window {
@@ -637,7 +627,7 @@ impl<'c> Run<'c> {
             }
             Def::Weight(w) => {
                 let row = *w as usize;
-                match self.weights.0.get(row).copied().flatten() {
+                match self.weights.rows.get(row).copied().flatten() {
                     Some(WeightRow::Dense(handle)) => handle,
                     Some(WeightRow::Planes(_)) => panic!(
                         "value {at} is weight {row}, a split-plane bank; it resolves \
@@ -681,11 +671,19 @@ impl<'c> Run<'c> {
             panic!("value {at} is not a weight, and split-plane banks live in the weight table");
         };
         let row = *w as usize;
-        match self.weights.0.get(row).copied().flatten() {
+        match self.weights.rows.get(row).copied().flatten() {
             Some(WeightRow::Planes(bank)) => Some(bank),
             Some(WeightRow::Dense(_)) => None,
             None => panic!("value {at} is weight {row}, which the shell has not bound"),
         }
+    }
+
+    /// Where a bank's experts sit, when it streams: the table the cut wrote.
+    pub(crate) fn seats(&self, id: ValueId) -> Option<Tensor> {
+        let Def::Weight(w) = &self.values[id.0 as usize].def else {
+            return None;
+        };
+        self.weights.seats.get(*w as usize).copied().flatten()
     }
 
     pub(crate) fn experts(&self, routes: ValueId) -> u32 {

@@ -125,7 +125,7 @@ impl Scratch {
         let of = |id: ValueId| rect(map, id, ceiling);
         let banked = |id: ValueId| match trace.values.get(id.0 as usize).map(|v| &v.def) {
             Some(Def::Weight(w)) => matches!(
-                weights.0.get(*w as usize).copied().flatten(),
+                weights.rows.get(*w as usize).copied().flatten(),
                 Some(WeightRow::Planes(_))
             ),
             _ => false,

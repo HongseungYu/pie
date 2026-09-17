@@ -434,8 +434,10 @@ pub fn matmul_grouped(
     let x = Tensor::new(x.buf, rows, x.width / groups_nz, x.dtype);
     let y = Tensor::new(y.buf, rows, y.width / groups_nz, y.dtype);
     match plane {
-        GroupedPlane::Bank(bank) => matmul_select_quant(ctx, x, bank, routes, y),
-        GroupedPlane::Dense(dense) => matmul_select(ctx, x, dense, routes, y),
+        // A grouped plane is one slab per group, resident: the routes name
+        // groups, and a group is its own row of the bank.
+        GroupedPlane::Bank(bank) => matmul_select_quant(ctx, x, bank, None, routes, y),
+        GroupedPlane::Dense(dense) => matmul_select(ctx, x, dense, None, routes, y),
     }
 }
 
@@ -525,10 +527,21 @@ fn routed_qmv_grid(
     Ok([x, out_width.div_ceil(4), top_k])
 }
 
+/// Where each expert's weights sit in the bank, as the pair every routed
+/// point takes: the table and whether to read it. A resident bank is seated
+/// at its own expert ids and passes nothing.
+fn seating(ctx: &Ctx<'_>, seats: Option<Tensor>) -> Result<[crate::encode::ArgValue; 2], Error> {
+    Ok(match seats {
+        Some(seats) => [seats.arg(), 1u32.arg()],
+        None => [ctx.absent()?, 0u32.arg()],
+    })
+}
+
 pub fn matmul_select(
     ctx: &Ctx<'_>,
     x: Tensor,
     bank: Tensor,
+    seats: Option<Tensor>,
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -536,6 +549,7 @@ pub fn matmul_select(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "select_gemv" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(OP, x, routes, y)?;
+    let seated = seating(ctx, seats)?;
     ctx.fire(
         Fire::at("linear/moe_select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
         &[
@@ -548,6 +562,8 @@ pub fn matmul_select(
             stated(OP, fan.top_k)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.x_slot_stride)?.arg(),
+            seated[0],
+            seated[1],
         ],
     )
 }
@@ -605,6 +621,7 @@ pub fn matmul_select_bias(
     x: Tensor,
     bank: Bank,
     bias: Tensor,
+    seats: Option<Tensor>,
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -617,6 +634,7 @@ pub fn matmul_select_bias(
     );
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
+    let seated = seating(ctx, seats)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
@@ -635,6 +653,8 @@ pub fn matmul_select_bias(
             stated(OP, fan.x_slot_stride)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.top_k)?.arg(),
+            seated[0],
+            seated[1],
         ],
     )
 }
@@ -643,6 +663,7 @@ pub fn matmul_select_quant(
     ctx: &Ctx<'_>,
     x: Tensor,
     bank: Bank,
+    seats: Option<Tensor>,
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
@@ -651,6 +672,7 @@ pub fn matmul_select_quant(
     let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
+    let seated = seating(ctx, seats)?;
     ctx.fire(
         Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
@@ -669,6 +691,8 @@ pub fn matmul_select_quant(
             stated(OP, fan.x_slot_stride)?.arg(),
             stated(OP, fan.x_row_stride)?.arg(),
             stated(OP, fan.top_k)?.arg(),
+            seated[0],
+            seated[1],
         ],
     )
 }
@@ -734,7 +758,8 @@ pub fn matmul_select_batched(
     bank: Bank,
     bias: Option<Tensor>,
     routes: Tensor,
-    (experts, id_base): (u32, u32),
+    experts: u32,
+    seats: Option<Tensor>,
     scratch: RoutedScratch,
     y: Tensor,
     tuning: &crate::DeviceTuning,
@@ -742,13 +767,9 @@ pub fn matmul_select_batched(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
     routed_bank(op, x, bank)?;
-    // `routes` carries ids in `id_base..id_base + experts`: the router's expert
-    // ids on a resident fire; on a streamed fire the seats those experts were
-    // landed in, a whole layer at `id_base` on the prefill ring, or anywhere in
-    // the pool (`id_base` 0, `experts` the seat count). An id `route_sort`
-    // cannot bin is silently skipped, so the row never lands and its output is
-    // whatever the arena held: past the bins, fall back to the per-row kernel,
-    // which indexes the bank by the id directly.
+    // `routes` names the router's own experts, seated or not, and `route_sort`
+    // silently skips an id it cannot bin: past its bins, fall back to the
+    // per-row kernel, which reads the seat table one row at a time.
     if experts > ROUTE_SORT_MAX_EXPERTS {
         return Ok(false);
     }
@@ -775,13 +796,13 @@ pub fn matmul_select_batched(
         let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
         bound.div_ceil(tile) * tile
     };
-    // The sorted stacks are `sorted_rows` deep for the router's expert count;
-    // a wider id space (the pool's seats) touches more bins and can pad past them.
-    if scratch.x.rows < padded || scratch.y.rows < padded {
-        return Ok(false);
-    }
+    debug_assert!(
+        scratch.x.rows >= padded && scratch.y.rows >= padded,
+        "`{op}`'s sorted stack is `sorted_rows` deep"
+    );
 
     let gather_fan = if fan.x_slot_stride == 0 { fan.top_k } else { 1 };
+    let seated = seating(ctx, seats)?;
     let sort = [
         routes.arg(),
         scratch.perm.arg_mut(),
@@ -795,7 +816,8 @@ pub fn matmul_select_batched(
         padded.arg(),
         x.width.arg(),
         0u32.arg(),
-        id_base.arg(),
+        seated[0],
+        seated[1],
     ];
     let lanes = router_lanes(op, experts)?;
     ctx.fire(

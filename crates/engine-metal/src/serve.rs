@@ -3735,7 +3735,6 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-                None,
             );
             walk(
                 &self.trace,
@@ -3829,9 +3828,6 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-                // routes on a streamed fire name seats, not experts (see
-                // `Tier::route_ids`)
-                tier,
             );
             walk(
                 &self.trace,

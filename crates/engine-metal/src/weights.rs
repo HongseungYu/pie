@@ -163,11 +163,17 @@ impl Weights {
             }
         }
 
-        let spans: Vec<(u64, u64)> = places
+        let mut spans: Vec<(u64, u64)> = places
             .iter()
             .filter(|p| !p.alias)
             .map(|p| (p.offset, p.reserved))
             .collect();
+        let tables_at = spans
+            .last()
+            .map_or(0, |&(offset, reserved)| offset + reserved);
+        if plan.seat_tables() > 0 {
+            spans.push((tables_at, plan.seat_tables()));
+        }
         let mut store = Store::zeroed(device, &spans, device.max_buffer())?;
 
         let mut host = HostSource::open(plan.source_bytes())?;
@@ -229,10 +235,18 @@ impl Weights {
             }));
         }
         let offsets: Vec<u64> = places.iter().map(|place| place.offset).collect();
+        let seats = seat_tables(plan, &store, handles, tables_at, places.len())?;
         let tier = plan
             .streams()
             .then(|| {
-                Tier::open(plan, &store, Source::landed(plan, host), &offsets).map(RefCell::new)
+                Tier::open(
+                    plan,
+                    &store,
+                    Source::landed(plan, host),
+                    &offsets,
+                    tables_at,
+                )
+                .map(RefCell::new)
             })
             .transpose()?;
         let rows = gather
@@ -250,7 +264,10 @@ impl Weights {
         Ok(Weights {
             store,
             warm: false,
-            table: WeightTable(weight_table),
+            table: WeightTable {
+                rows: weight_table,
+                seats,
+            },
             tier,
             rows,
             banks: banks(trace, &places, |at| places[at].offset),
@@ -371,7 +388,7 @@ impl Weights {
             let model_ir::ParamLayout::ConvTapsMajor { c_in, taps } = param.layout else {
                 continue;
             };
-            let Some(Some(WeightRow::Dense(plane))) = self.table.0.get(at).copied() else {
+            let Some(Some(WeightRow::Dense(plane))) = self.table.rows.get(at).copied() else {
                 return Err(Fault::Param {
                     name: param.name.clone(),
                     why: "is a convolution weight that did not land as one dense plane",
@@ -406,7 +423,7 @@ impl Weights {
             let mut buffer = Buffer::zeroed(device, relabelled.len() as u64)?;
             buffer.write(0, &relabelled)?;
             let handle = handles.bind(&buffer, 0, relabelled.len() as u64)?;
-            self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
+            self.table.rows[at] = Some(WeightRow::Dense(Tensor::new(
                 handle,
                 plane.rows,
                 plane.width,
@@ -428,7 +445,7 @@ impl Weights {
         let mut wanted = crate::decoded::absorbed_weights(trace);
         wanted.extend(crate::decoded::lane_axis_weights(trace));
         for at in wanted {
-            let Some(Some(WeightRow::Planes(bank))) = self.table.0.get(at).copied() else {
+            let Some(Some(WeightRow::Planes(bank))) = self.table.rows.get(at).copied() else {
                 continue;
             };
             let param = &trace.params[at];
@@ -466,7 +483,7 @@ impl Weights {
             buffer.write(0, &plane)?;
             let handle = handles.bind(&buffer, 0, plane.len() as u64)?;
             decoded_bytes += plane.len() as u64;
-            self.table.0[at] = Some(WeightRow::Dense(Tensor::new(
+            self.table.rows[at] = Some(WeightRow::Dense(Tensor::new(
                 handle,
                 u32::try_from(n).unwrap_or(u32::MAX),
                 u32::try_from(k).unwrap_or(u32::MAX),
@@ -876,7 +893,7 @@ fn warm(
         }
     }
 
-    let spans: Vec<(u64, u64)> = places
+    let mut spans: Vec<(u64, u64)> = places
         .iter()
         .enumerate()
         .filter_map(|(index, place)| match seats[index] {
@@ -891,6 +908,10 @@ fn warm(
         store_bytes,
         "the store's spans pack to the bytes the arm counted"
     );
+    let tables_at = store_bytes;
+    if plan.seat_tables() > 0 {
+        spans.push((tables_at, plan.seat_tables()));
+    }
     let mut store =
         Store::zeroed(device, &spans, device.max_buffer()).map_err(|why| Some(why.to_string()))?;
     if !landed.is_empty() {
@@ -997,6 +1018,7 @@ fn warm(
                 &store,
                 Source::artifact(std::sync::Arc::clone(&map), bands),
                 &seated,
+                tables_at,
             )
             .map(RefCell::new)
         })
@@ -1015,16 +1037,50 @@ fn warm(
         })
         .transpose()
         .map_err(|why| Some(format!("its gathered row slab does not open ({why})")))?;
+    let seat_of = seat_tables(plan, &store, handles, tables_at, places.len())
+        .map_err(|why| Some(format!("its seat tables do not bind ({why})")))?;
     Ok(Weights {
         store,
         warm: true,
-        table: WeightTable(table),
+        table: WeightTable {
+            rows: table,
+            seats: seat_of,
+        },
         tier,
         rows,
         banks: banks(trace, places, |at| seated[at]),
         residue: (residue_planes, residue_bytes),
         decoded: Vec::new(),
     })
+}
+
+/// One table per group, laid end to end after the planes at `at`: where each
+/// of a group's experts sits in the shared pool. Every band of a group reads
+/// the same table, the bias plane included, because a seat holds one expert
+/// across all of them. The cut writes them; the routed points read them.
+fn seat_tables(
+    plan: &Plan,
+    store: &Store,
+    handles: &Handles,
+    at: u64,
+    params: usize,
+) -> Result<Vec<Option<Tensor>>> {
+    let stride = plan.seat_table_stride();
+    let mut out = vec![None; params];
+    if stride == 0 {
+        return Ok(out);
+    }
+    for band in plan.bands() {
+        let experts = band.experts;
+        let offset = at + band.group as u64 * stride;
+        out[band.param] = Some(Tensor::new(
+            store.bind(handles, offset, u64::from(experts) * 4)?,
+            1,
+            experts,
+            Dtype::I32,
+        ));
+    }
+    Ok(out)
 }
 
 fn residue_of(contract: &ModelContract, name: &str) -> Option<TensorContract> {

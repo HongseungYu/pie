@@ -537,8 +537,10 @@ impl Plan {
             host_of.insert(band.param, host_bytes);
             host_bytes += u64::from(band.experts) * band.stride;
         }
+        let tables =
+            (u64::from(experts) * 4).next_multiple_of(crate::weights::ALIGN) * groups.len() as u64;
         Ok(Plan {
-            device_bytes: dense + seats(slots + ring),
+            device_bytes: dense + seats(slots + ring) + tables,
             knobs,
             bands,
             groups,
@@ -580,6 +582,22 @@ impl Plan {
     #[must_use]
     pub fn regions(&self) -> &[RegionPlan] {
         &self.regions
+    }
+
+    /// Bytes one group's seat table takes on the device: where each of its
+    /// experts sits in the pool, one `u32` apiece, aligned like a plane.
+    #[must_use]
+    pub fn seat_table_stride(&self) -> u64 {
+        match self.groups.first() {
+            Some(group) => (u64::from(group.experts) * 4).next_multiple_of(crate::weights::ALIGN),
+            None => 0,
+        }
+    }
+
+    /// Bytes every group's seat table takes, laid end to end.
+    #[must_use]
+    pub fn seat_tables(&self) -> u64 {
+        self.seat_table_stride() * self.groups.len() as u64
     }
 
     /// Seats in the shared pool.

@@ -189,9 +189,9 @@ pub struct Tier {
     gpu_ns: u64,
     hint_of: BTreeMap<u32, ValueId>,
     predicted: Vec<Option<Vec<Vec<u32>>>>,
-    /// Per group: the first seat of the ring half its routes were last
-    /// rewritten to, `None` when they were seated into the pool.
-    on_ring: Vec<Option<u32>>,
+    /// Where this load's seat tables start in the store, and how far apart
+    /// they are: group `g`'s table sits at `tables.0 + g * tables.1`.
+    tables: (u64, u64),
     inflight: Option<std::thread::JoinHandle<Result<()>>>,
     file: Option<std::sync::Arc<std::fs::File>>,
     prefetch: bool,
@@ -210,24 +210,36 @@ pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
 const SEAT_THREADS: usize = 16;
 
 impl Tier {
-    /// The ids a group's routing vector names once its cut has run, as
-    /// `(count, first)`: `None` when this tier does not seat the group (the
-    /// router's own expert ids); `experts` seats from the ring half's first
-    /// seat after `ring_at`; else any of the pool's seats plus the ring's
-    /// (`segment_rows` seats wherever the LRU lands them).
-    #[must_use]
-    pub fn route_ids(&self, routes: ValueId, experts: u32) -> Option<(u32, u32)> {
-        let at = *self.of_routes.get(&routes.0)?;
-        Some(match self.on_ring[at] {
-            Some(first) => (experts, first),
-            None => (
-                self.pool.slots + self.ring.as_ref().map_or(0, |ring| 2 * ring.experts),
-                0,
-            ),
-        })
+    /// Say where group `at`'s experts sit, so the matmuls that follow this
+    /// cut read the seats the tier landed them in. `seat_of` answers for a
+    /// pool segment; a ring segment holds the whole layer in one run from
+    /// `first`. An expert this segment does not route to is written as seat
+    /// zero and never read: only the experts a row names are looked up.
+    fn say_seats(&mut self, at: usize, first: Option<u32>) -> Result<()> {
+        let experts = self.groups[at].experts as usize;
+        let mut table = Vec::with_capacity(experts * 4);
+        for expert in 0..experts {
+            let seat = match first {
+                Some(first) => first + expert as u32,
+                None => self.groups[at].seat_of[expert].unwrap_or(0),
+            };
+            table.extend_from_slice(&seat.to_le_bytes());
+        }
+        let (base, stride) = self.tables;
+        self.store.write(base + at as u64 * stride, &table)
     }
 
-    pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
+    /// `tables` is where this load's seat tables start in the store: one of
+    /// `experts` `u32`s per group, `seat_table_stride` apart, saying where
+    /// each expert sits. Every cut rewrites its group's before the matmuls
+    /// read it.
+    pub fn open(
+        plan: &Plan,
+        store: &Store,
+        source: Source,
+        offsets: &[u64],
+        tables: u64,
+    ) -> Result<Tier> {
         tally::open_log(plan.knobs.log.as_deref());
         let mut tier = Tier {
             store: store.clone(),
@@ -266,7 +278,7 @@ impl Tier {
                 .filter_map(|group| group.hint.map(|hint| (group.routes.0, hint)))
                 .collect(),
             predicted: vec![None; plan.groups.len()],
-            on_ring: vec![None; plan.groups.len()],
+            tables: (tables, plan.seat_table_stride()),
             prediction: Prediction::default(),
             inflight: None,
             file: None,
@@ -458,7 +470,6 @@ impl Tier {
         whole: bool,
     ) -> Result<()> {
         self.join_inflight()?;
-        self.on_ring[at] = None;
         if whole && self.ring.is_some() {
             return self.ring_at(at, arena, handles, routes, rect, span);
         }
@@ -530,9 +541,9 @@ impl Tier {
         if span.rows == 0 {
             return Ok(());
         }
-        let (first, mut raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
+        let (_, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
         self.dump_rows(at, &raw, rect.width as usize);
-        for entry in raw.as_chunks_mut::<4>().0 {
+        for entry in raw.as_chunks::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
                 continue;
@@ -547,11 +558,10 @@ impl Tier {
                     self.groups[at].bands[0].name, self.groups[at].experts
                 )));
             }
-            let seat = self.seat(at, expert)?;
-            entry.copy_from_slice(&(seat as i32).to_le_bytes());
+            self.seat(at, expert)?;
         }
         self.flush()?;
-        arena.write(first, &raw)?;
+        self.say_seats(at, None)?;
         if self.prefetch
             && let Some(rows) = self.predicted.get(at + 1).cloned().flatten()
         {
@@ -578,12 +588,12 @@ impl Tier {
             let ring = self.ring.as_ref().expect("the caller checked");
             (ring.base + half as u32 * ring.experts, ring.experts)
         };
-        self.on_ring[at] = Some(base);
+        self.say_seats(at, Some(base))?;
         if span.rows > 0 {
-            let (first, mut raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
+            let (_, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
             self.dump_rows(at, &raw, rect.width as usize);
             let mut lookups = 0u64;
-            for entry in raw.as_chunks_mut::<4>().0 {
+            for entry in raw.as_chunks::<4>().0 {
                 let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
                 if id < 0 {
                     continue;
@@ -596,10 +606,8 @@ impl Tier {
                         self.groups[at].bands[0].name, experts
                     )));
                 }
-                entry.copy_from_slice(&((base + expert) as i32).to_le_bytes());
                 lookups += 1;
             }
-            arena.write(first, &raw)?;
             if let Some(ring) = self.ring.as_mut() {
                 ring.lookups += lookups;
             }

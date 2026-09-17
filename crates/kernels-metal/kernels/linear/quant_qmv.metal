@@ -363,6 +363,8 @@ METAL_FUNC void qmv_gptoss_impl(
     device T* y,
     const device T* bias,
     const device int* expert_ids,
+    const device int* seats,
+    int seated,
     int in_vec_size,
     int out_vec_size,
     int x_slot_stride,
@@ -395,12 +397,18 @@ METAL_FUNC void qmv_gptoss_impl(
   const int row = int(tid.x);
   const int slot = ROUTED ? int(tid.z) : 0;
   const int sel = row * slots_per_row + slot;
+  // The seat this expert's weights sit in: the streamed tier lands an expert
+  // wherever its pool has room, so the id the router names is not the row of
+  // the bank. `seated` is 0 for a resident bank, where they are the same.
+  const int held = ROUTED && expert_ids[sel] >= 0
+      ? (seated ? seats[expert_ids[sel]] : expert_ids[sel])
+      : -1;
   if (ROUTED) {
 
-    if (expert_ids[sel] < 0) {
+    if (held < 0) {
       return;
     }
-    const size_t e = size_t(expert_ids[sel]);
+    const size_t e = size_t(held);
     ws += e * size_t(out_vec_size) * size_t(in_vec_size_w);
     scales += e * size_t(out_vec_size) * size_t(in_vec_size_g);
     if (Codec::zero_point) {
@@ -434,7 +442,7 @@ METAL_FUNC void qmv_gptoss_impl(
   device T* y_row = y + (ROUTED ? sel : row) * out_vec_size + out_row;
   const device T* bias_row = bias;
   if (BIASED && ROUTED) {
-    bias_row += size_t(expert_ids[sel]) * size_t(out_vec_size);
+    bias_row += size_t(held) * size_t(out_vec_size);
   }
   for (int row = 0; row < results_per_simdgroup; row++) {
     U v = simd_sum(result[row]);
@@ -460,12 +468,15 @@ METAL_FUNC void qmv_gptoss_impl(
       const constant int& x_slot_stride [[buffer(9)]],                         \
       const constant int& x_row_stride  [[buffer(10)]],                        \
       const constant int& slots_per_row [[buffer(11)]],                        \
+      const device int* seats     [[buffer(12)]],                              \
+      const constant int& seated  [[buffer(13)]],                              \
       uint3 tid       [[threadgroup_position_in_grid]],                        \
       uint simd_gid   [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid   [[thread_index_in_simdgroup]]) {                         \
     qmv_gptoss_impl<T, Codec<T>, BIASED, ROUTED, PPT>(                              \
-        w, scales, biases, x, y, bias, expert_ids, in_vec_size, out_vec_size,  \
-        x_slot_stride, x_row_stride, slots_per_row, tid, simd_gid, simd_lid);  \
+        w, scales, biases, x, y, bias, expert_ids, seats, seated,              \
+        in_vec_size, out_vec_size, x_slot_stride, x_row_stride,                \
+        slots_per_row, tid, simd_gid, simd_lid);                               \
   }
 
 gptoss_qmv_kernel(qmv_tail, false, false, 2)
@@ -485,6 +496,7 @@ gptoss_qmv_kernel(qmv_routed_p2, false, true, 2)
       const device itype*, device itype*, const constant int&,                \
       const constant int&, const device itype*, const device int*,            \
       const constant int&, const constant int&, const constant int&,          \
+      const device int*, const constant int&,                                 \
       uint3, uint, uint);
 
 instantiate_gptoss_qmv(affine_qmv_tail, qmv_tail, AffineU4, bfloat16, bfloat, 64, 4)

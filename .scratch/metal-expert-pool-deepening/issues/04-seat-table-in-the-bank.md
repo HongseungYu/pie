@@ -1,6 +1,6 @@
-# 04 Routes keep expert ids; the bank carries a seat table
+# 04 Routes keep expert ids; a seat table says where they sit
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: 02, 03
 
@@ -23,3 +23,30 @@ instead of rewriting routes.
 
 Gate: check/clippy/lib tests, then one harness decode vs RESULTS.md
 (kernel change).
+
+## Comments
+
+2026-09-17: done, with one change of plan. The table hangs off the weight
+table (`WeightTable.seats`, one entry per weight row, bound from the end of
+the store) rather than off `kernels_metal::Bank`: a bf16 expert bank is a
+`WeightRow::Dense` and has no `Bank`, yet `found` streams those too, so the
+bank could not carry the table for every routed point. The dispatcher asks
+the weight table (`Run::seats`), a load-time fact, so the `RefCell`
+reach-back into the tier is gone either way. ADR-0001 records this.
+
+Kernels: `route_sort` bins the router's own ids again and writes the seat
+into `tile_expert`/`row_expert`; `select_gemv` and the routed `qmv_gptoss`
+points take `(seats, seated)` and translate before they address the bank,
+the scales, the zero points and the expert bias, all of which stream
+together as bands of one group and so share a seat. The batched
+`quant_qmm_t` kernel is untouched: it reads the seat out of `tile_expert`.
+
+Engine: `Tier::say_seats` writes its group's table at every cut (E u32s,
+2 KiB for this model) and the routing vector is no longer rewritten.
+Deleted `Tier::route_ids`, `Tier.on_ring`, `Run.tier`, `Run::route_space`,
+the `(experts, id_base)` tuple, the `id_base` kernel argument and the two
+silent fallbacks; the sorted-stack check is a `debug_assert` again.
+
+Gate: clippy --all-targets clean, lib tests 20 passed, and a smoke run
+(32 teacher-forced tokens, 4000 seats) decoded the recorded tokens exactly.
+Untested path: the bf16 `select_gemv` point, which no imported model uses.
