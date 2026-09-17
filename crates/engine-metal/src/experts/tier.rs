@@ -251,6 +251,11 @@ impl Tier {
         // rather than borrow twice.
         self.join_inflight()?;
         self.return_ring()?;
+        // The fire before this one is over and its final frame has landed
+        // (the token came out of it), so the seats its last segment held
+        // for its matmuls are free again. Left held, a pool at the floor
+        // could not lend a second prefill its whole ring.
+        self.pool.release(Hold::Segment);
         let whole = self.prefill_min > 0
             && lane_rows.iter().any(|&rows| rows >= self.prefill_min)
             && self.ring.is_some();
