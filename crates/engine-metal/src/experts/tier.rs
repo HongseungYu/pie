@@ -1061,6 +1061,11 @@ impl Tier {
         self.tally.gpu_ns += ns;
     }
 
+    /// Host time the n-gram row gather took this fire.
+    pub fn note_rows(&mut self, ns: u64) {
+        self.tally.rows_ns += ns;
+    }
+
     #[must_use]
     pub fn source(&self) -> Option<(u64, u64)> {
         self.source.backing()

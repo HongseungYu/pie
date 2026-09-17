@@ -186,8 +186,18 @@ impl<'a> Sink<'a> {
             ids,
             "an n-gram id vector",
             |rect, span, arena| {
-                rows.borrow_mut()
-                    .segment(arena, self.handles, ids, rect, span)
+                // The n-gram rows come out of a 25 GB mapping, so this is the
+                // page cache's time as much as the gather's; the tier keeps
+                // it apart from the reads it prices.
+                let started = std::time::Instant::now();
+                let out = rows
+                    .borrow_mut()
+                    .segment(arena, self.handles, ids, rect, span);
+                if let Some(tier) = cuts.tier {
+                    tier.borrow_mut()
+                        .note_rows(started.elapsed().as_nanos() as u64);
+                }
+                out
             },
         )
     }

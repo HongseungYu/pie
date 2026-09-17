@@ -25,3 +25,27 @@ host its memory: `sm_probe_seats.sh` tries 8192 / 9216 / 10240 / 11204 with `all
 pass misses nothing.
 
 Every run's memory before and after is now on `out/sm_runs.log`.
+
+## The probe (2026-09-17 18:20, `sm-probe-s*`, `all_in_mem` 128 tokens, heater h3b)
+
+| seats | resident pass misses/step | prime pass `enc` | resident `enc` | 1-miss call (median) |
+|---|---|---|---|---|
+| 8192 | 70.4 | 7.65 | 3.05 | 0.74-0.75 |
+| 9216 | 58.0 | 7.73 | 7.60 | 0.76 |
+| 10240 | 46.4 | 7.64 | 7.47 | 0.78 |
+| 11204 | 23.1 | 7.85 | 7.20 | 0.96-1.07 |
+
+Two findings. **No pool that boots holds a 128-step window of this sequence's head**: the
+prime pass touches about 100 new (layer, expert) pairs a step (128 x ~98 = 12.5k, plus the
+ring's 1024), more than 11204 seats. Sixty-four steps (7.1k + 1k) fit at 11204 and just about
+at 9216. The sequence's tail is a loop (85 distinct tokens over positions 768-1024), so
+replaying it (`profile_run.py --forced-offset 768`) is the way to a long zero-miss window.
+
+**`enc` is 7.6 ms early in the life of every pool from 8192 up**, not only at 11204, and
+it falls with the run's age (8192's resident pass: 3.05). It does not follow the misses.
+The one host cost inside the walk that depends on the page cache is the n-gram (PLE) row
+gather, mmap'd from a 25.6 GB table: each step needs rows at random pages of it, and once
+the pool has wired most of the host's memory those pages are evicted between uses and
+re-faulted from disk — the previous effort saw `ple_host` swing 0.1-1.2 ms with the page
+cache at 4000 seats. From commit (this one) the fire record carries `ple_ms`, the gather's
+own host time, so the reader shows it apart from the encode.
