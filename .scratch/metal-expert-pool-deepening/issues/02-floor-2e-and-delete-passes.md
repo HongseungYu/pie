@@ -1,6 +1,6 @@
 # 02 Floor 2E and delete Metal's pass feeding
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: 01
 
@@ -41,3 +41,13 @@ derivation (only `stream_rows_per_cut` caps now), diag `pass-half` and
 reader left). 48 insertions, 299 deletions. Gate: clippy --all-targets
 clean, lib tests 20 passed; harness decode pending the machine being
 free.
+
+2026-09-17, harness gate (clean mode, 4000 seats, heater on, 1k prompt,
+1024 teacher-forced tokens, `PIE_BIN` pointed at this branch's release
+build): every forced-token assertion passed, so seating decodes exactly
+what it did before. Step 122.36 ms mean (8.17 tok/s), 109.40 ms over the
+last 512 (9.14 tok/s) against RESULTS.md's 130.40/130.17 ms baseline;
+decode hit rate 67.9% against 66%. No regression; the gain is the ring
+fire reaching the batched kernel again (0f1155a6), which the baseline run
+predates. The boot line reads `4000 seats ... + a prefill ring of 1024
+seats`, i.e. the floor is now one layer (E = 512) and the ring is 2E.
