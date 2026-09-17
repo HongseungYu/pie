@@ -477,6 +477,9 @@ constant constexpr uint kMaxExperts = 1024;
     const constant uint& padded            [[buffer(9)]],
     const constant uint& width             [[buffer(10)]],
     const constant uint& x_pitch           [[buffer(11)]],
+    // ids are binned as `id - id_base`: a routing vector rewritten to seats of one
+    // contiguous run (the prefill ring) sorts by expert with the seat kept in tile_expert
+    const constant uint& id_base           [[buffer(12)]],
     uint lid                    [[thread_position_in_threadgroup]],
     uint nthreads               [[threads_per_threadgroup]]) {
     threadgroup atomic_uint counts[kMaxExperts];
@@ -497,7 +500,7 @@ constant constexpr uint kMaxExperts = 1024;
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
 
     for (uint i = lid; i < n; i += nthreads) {
-        const int e = expert_ids[i];
+        const int e = expert_ids[i] - int(id_base);
         if (e >= 0 && uint(e) < E) {
             atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
         }
@@ -531,7 +534,7 @@ constant constexpr uint kMaxExperts = 1024;
         const uint at = sg_sum[sg] + within;
         base[lid] = at;
         for (uint t = at / tile; t < (at + span) / tile && t < tiles; ++t) {
-            tile_expert[t] = int(lid);
+            tile_expert[t] = int(lid + id_base);
         }
 
         atomic_store_explicit(&counts[lid], 0u, memory_order_relaxed);
@@ -540,12 +543,12 @@ constant constexpr uint kMaxExperts = 1024;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = lid; i < n; i += nthreads) {
-        const int e = expert_ids[i];
+        const int e = expert_ids[i] - int(id_base);
         if (e < 0 || uint(e) >= E) continue;
         const uint at = base[e] + atomic_fetch_add_explicit(&counts[e], 1u, memory_order_relaxed);
         if (at < padded) {
             perm[at] = int(i);
-            row_expert[at] = e;
+            row_expert[at] = e + int(id_base);
             inv[i] = int(at);
         }
     }

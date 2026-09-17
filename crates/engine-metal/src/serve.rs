@@ -3763,7 +3763,7 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-                0,
+                None,
             );
             walk(
                 &self.trace,
@@ -3857,10 +3857,9 @@ impl Shell {
                 &p.windows,
                 &place,
                 &self.scratch,
-                // Routes on a streamed fire name seats, not experts (see
-                // `Tier::pass_at` / `ring_at`), and the pool plus its ring
-                // is the space those ids live in.
-                tier.map_or(0, |tier| tier.borrow().seat_space()),
+                // routes on a streamed fire name seats, not experts (see
+                // `Tier::route_ids`)
+                tier,
             );
             walk(
                 &self.trace,

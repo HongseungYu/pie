@@ -734,7 +734,7 @@ pub fn matmul_select_batched(
     bank: Bank,
     bias: Option<Tensor>,
     routes: Tensor,
-    experts: u32,
+    (experts, id_base): (u32, u32),
     scratch: RoutedScratch,
     y: Tensor,
     tuning: &crate::DeviceTuning,
@@ -742,11 +742,13 @@ pub fn matmul_select_batched(
     dtype_dispatch!(op, x.dtype, { Bf16 => () });
     let fan = selected(op, x, routes, y)?;
     routed_bank(op, x, bank)?;
-    // `experts` bounds the ids `routes` carries. On a streamed fire that is
-    // the seat count (pool + ring), which can exceed what `route_sort` bins;
-    // an id it cannot bin is silently skipped, so the row never lands and its
-    // output is whatever the arena held. Fall back to the per-row kernel,
-    // which indexes the bank by the id directly, rather than lose rows.
+    // `routes` carries ids in `id_base..id_base + experts`: the router's expert
+    // ids on a resident fire; on a streamed fire the seats those experts were
+    // landed in, a whole layer at `id_base` on the prefill ring, or anywhere in
+    // the pool (`id_base` 0, `experts` the seat count). An id `route_sort`
+    // cannot bin is silently skipped, so the row never lands and its output is
+    // whatever the arena held: past the bins, fall back to the per-row kernel,
+    // which indexes the bank by the id directly.
     if experts > ROUTE_SORT_MAX_EXPERTS {
         return Ok(false);
     }
@@ -773,10 +775,11 @@ pub fn matmul_select_batched(
         let bound = pairs.saturating_add(touched.saturating_mul(tile - 1));
         bound.div_ceil(tile) * tile
     };
-    debug_assert!(
-        scratch.x.rows >= padded && scratch.y.rows >= padded,
-        "`{op}`'s sorted stack is `sorted_rows` deep"
-    );
+    // The sorted stacks are `sorted_rows` deep for the router's expert count;
+    // a wider id space (the pool's seats) touches more bins and can pad past them.
+    if scratch.x.rows < padded || scratch.y.rows < padded {
+        return Ok(false);
+    }
 
     let gather_fan = if fan.x_slot_stride == 0 { fan.top_k } else { 1 };
     let sort = [
@@ -792,6 +795,7 @@ pub fn matmul_select_batched(
         padded.arg(),
         x.width.arg(),
         0u32.arg(),
+        id_base.arg(),
     ];
     let lanes = router_lanes(op, experts)?;
     ctx.fire(

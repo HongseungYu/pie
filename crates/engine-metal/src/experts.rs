@@ -1152,6 +1152,9 @@ pub struct Tier {
     hint_of: BTreeMap<u32, ValueId>,
     predicted: Vec<Option<Vec<Vec<u32>>>>,
     passing: Vec<Option<Passing>>,
+    /// Per group: the first seat of the ring half its routes were last
+    /// rewritten to, `None` when they were seated into the pool.
+    on_ring: Vec<Option<u32>>,
     inflight: Option<std::thread::JoinHandle<Result<()>>>,
     file: Option<std::sync::Arc<std::fs::File>>,
     prefetch: bool,
@@ -1315,13 +1318,21 @@ pub const PREDICTION_PREFIXES: [usize; 4] = [6, 8, 12, 16];
 const SEAT_THREADS: usize = 16;
 
 impl Tier {
-    /// Every seat a routing vector may name on a streamed fire: the pool's
-    /// own plus the prefill ring's two halves. `pass_at` seats into the
-    /// pool and `ring_at` into the ring, and both rewrite the routes to
-    /// those seat numbers before the matmuls run.
+    /// The ids a group's routing vector names once its cut has run, as
+    /// `(count, first)`: `None` when this tier does not seat the group (the
+    /// router's own expert ids); `experts` seats from the ring half's first
+    /// seat after `ring_at`; else any of the pool's seats plus the ring's
+    /// (`pass_at` and `segment_rows` seat wherever the LRU lands them).
     #[must_use]
-    pub fn seat_space(&self) -> u32 {
-        self.pool.slots + self.ring.as_ref().map_or(0, |ring| 2 * ring.experts)
+    pub fn route_ids(&self, routes: ValueId, experts: u32) -> Option<(u32, u32)> {
+        let at = *self.of_routes.get(&routes.0)?;
+        Some(match self.on_ring[at] {
+            Some(first) => (experts, first),
+            None => (
+                self.pool.slots + self.ring.as_ref().map_or(0, |ring| 2 * ring.experts),
+                0,
+            ),
+        })
     }
 
     pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
@@ -1363,6 +1374,7 @@ impl Tier {
                 .collect(),
             predicted: vec![None; plan.groups.len()],
             passing: vec![None; plan.groups.len()],
+            on_ring: vec![None; plan.groups.len()],
             prediction: Prediction::default(),
             inflight: None,
             file: None,
@@ -1556,9 +1568,12 @@ impl Tier {
         whole: bool,
     ) -> Result<u32> {
         self.join_inflight()?;
+        self.on_ring[at] = None;
         if whole && self.ring.is_some() {
             return self.ring_at(at, arena, handles, routes, rect, span);
         }
+        // a fill a refused fire left in flight copies from seats this segment evicts
+        self.ring_join(usize::MAX)?;
         if pass.1 > 1 {
             return self.pass_at(at, arena, handles, routes, rect, span, pass);
         }
@@ -1794,13 +1809,14 @@ impl Tier {
         self.pool.pinned.fill(false);
         self.segments += 1;
         let half = self.ring_ready(at)?;
+        let (base, experts) = {
+            let ring = self.ring.as_ref().expect("the caller checked");
+            (ring.base + half as u32 * ring.experts, ring.experts)
+        };
+        self.on_ring[at] = Some(base);
         if span.rows > 0 {
             let (first, mut raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
             self.dump_rows(at, &raw, rect.width as usize);
-            let (base, experts) = {
-                let ring = self.ring.as_ref().expect("the caller checked");
-                (ring.base + half as u32 * ring.experts, ring.experts)
-            };
             let mut lookups = 0u64;
             for entry in raw.as_chunks_mut::<4>().0 {
                 let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
