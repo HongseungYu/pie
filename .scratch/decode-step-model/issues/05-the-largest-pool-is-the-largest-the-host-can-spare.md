@@ -1,6 +1,6 @@
 # 05 The largest pool is the largest the host can spare
 
-Status: claimed
+Status: resolved
 Type: research
 
 Configuration 2 asks for the largest pool that boots, about 11204-12000 seats on this 48 GB
@@ -71,3 +71,20 @@ Also from these two runs: replaying the sequence's looping tail does not shrink 
 union (76 misses a step in the resident pass at 8192, 37 at 11204): a repeated token in a
 different context routes to different experts. The zero-miss window stays what a pool holds
 of the head, about 64 steps.
+
+## Answer (2026-09-17 19:05)
+
+`sm-d3-head-s8192` and `sm-d4-head-s9216` (the sequence's head, 64 tokens):
+
+| seats | resident misses/step | `ple_ms` | step (last 40) | note |
+|---|---|---|---|---|
+| 8192 | 12.4 (153, 112, 38 ... then 1-7) | 0.03 | 45.9 | the resident's prefill borrows the 1024 coldest seats, which at a full pool are the earliest decode steps' experts |
+| 9216 | **0.0** | 0.09 | **38.56** (p10 38.21, p90 38.94) | clean |
+| 11204 | 0.0 (issue 01/02 runs) | ~7 | 43.2 | the n-gram pages fault every step |
+
+**Configuration 2-4 run at 9216 seats** (24.3 GiB of seats; the largest at which the n-gram
+rows stay cached between requests), the zero-miss window is **48 tokens** (a 64-step head
+fits at 9216 with the ring's 1024 to spare; 48 leaves margin), and every `steps` run warms
+the whole 1024-token sequence first. The floor is 38.6 ms, not the 43-45 of the earlier
+11204-seat runs, whose extra was page faults: C = 33.4 (cut frames 30.3 + final frame
+3.0), F = 5.2 (turnaround 3.9, seating 0.2, n-gram rows 0.1, encode 0.8, after the walk 0.3).
