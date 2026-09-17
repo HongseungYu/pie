@@ -38,6 +38,29 @@ struct Input {
     prompt: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
+    /// Optional teacher-forced continuation: comma-separated token ids. When
+    /// given, each step feeds the next id here instead of the greedy pick, so
+    /// two engines route the same experts (measurement only).
+    #[serde(default)]
+    force: String,
+    /// Sampling temperature. 0.0 (the default) is exact greedy decoding, which
+    /// is what the serving gate checks; a positive value switches to nucleus
+    /// sampling so a long decode does not collapse into a repetition loop.
+    #[serde(default)]
+    temperature: f32,
+    #[serde(default = "default_top_p")]
+    top_p: f32,
+    /// Seed for the in-graph Gumbel noise, so a sampled run is reproducible.
+    #[serde(default = "default_seed")]
+    seed: u32,
+}
+
+fn default_top_p() -> f32 {
+    0.95
+}
+
+fn default_seed() -> u32 {
+    0x51ed
 }
 
 fn default_prompt() -> String {
@@ -54,6 +77,9 @@ struct Output {
     text: String,
     /// How many tokens it is.
     count: usize,
+    /// The greedy pick at every step, before any `force` substitution: with
+    /// `force` given this is the model's own prediction of each forced token.
+    picked: Vec<u32>,
     /// The continuation's token ids.
     ///
     /// **LAST, AND THAT IS LOAD-BEARING.** `pie::sweep::fleet` — the fleet
@@ -70,9 +96,35 @@ fn greedy(logits: Tensor) -> Tensor {
     reshape(reduce_argmax(&logits), [1])
 }
 
+/// The pick for this step, as a one-lane `[1]` i32 cell: greedy at temperature
+/// 0, nucleus sampling above it. `r` is the taken `[2]` u32 rng state
+/// (`[key, ctr]`) that drives the Gumbel noise.
+fn pick(r: &Tensor, temperature: f32, top_p: f32) -> Tensor {
+    let logits = intrinsics::logits();
+    if temperature == 0.0 {
+        return greedy(logits);
+    }
+    reshape(nucleus_sample(&(&logits / temperature.max(1e-4)), top_p, r), [1])
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let max_tokens = input.max_tokens;
+    let temperature = input.temperature;
+    let top_p = input.top_p;
+    let seed = input.seed;
+    if !(0.0..=1.0).contains(&top_p) || top_p == 0.0 {
+        return Err("top_p must be greater than 0 and at most 1".into());
+    }
+    if !temperature.is_finite() || temperature < 0.0 {
+        return Err("temperature must be finite and not negative".into());
+    }
+    let force: Vec<i32> = input
+        .force
+        .split(',')
+        .filter_map(|w| w.trim().parse::<i32>().ok())
+        .collect();
+    let forced = |i: usize, sampled: i32| -> i32 { force.get(i).copied().unwrap_or(sampled) };
     let ws = WorkingSet::new();
     // The recurrent state, on a model that folds one: a row per sequence,
     // and this program is one sequence. On a pure-attention model there is
@@ -96,9 +148,11 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(Output {
             text: String::new(),
             count: 0,
+            picked: Vec::new(),
             tokens: Vec::new(),
         });
     }
+    let mut picked: Vec<u32> = Vec::with_capacity(max_tokens);
 
     // The model's opening (`<bos>` where it has one) before the raw text: a
     // gemma without it answers noise.
@@ -133,6 +187,7 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from_iter((base..end).map(|p| p % page_size)).named("w_off_p");
         let kv_len = Channel::from([end]).named("kv_len_p");
         let tok_out = Channel::new([1], dtype::i32).named("tok_out_p");
+        let rng_p = Channel::from([seed, base]).named("rng_p");
 
         let fwd = ForwardPass::new();
         fwd.embed(&toks, &embed_indptr)?;
@@ -158,7 +213,9 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.epilogue(move || {
-            tok_out.put(&greedy(intrinsics::logits()));
+            let r = rng_p.take();
+            tok_out.put(&pick(&r, temperature, top_p));
+            rng_p.put(&(&r + iota(2)));
         });
         fwd.submit(&pipe)
             .with_context(|| format!("prefill submit @{base}"))?;
@@ -170,6 +227,8 @@ async fn main(input: Input) -> Result<Output> {
             .await
             .with_context(|| format!("prefill drain @{base}"))?;
     }
+    picked.push(first as u32);
+    let first = forced(0, first);
     generated.push(first as u32);
 
     // ── DECODE (1-wide, host-driven token) ────────────────────────────────
@@ -202,6 +261,7 @@ async fn main(input: Input) -> Result<Output> {
         let w_off = Channel::from([n % page_size]).named("w_off");
         let kv_len = Channel::from([n + 1]).named("kv_len");
         let tok_out = Channel::new([1], dtype::i32).named("tok_out");
+        let rng = Channel::from([seed, n]).named("rng");
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &embed_indptr)?;
@@ -237,12 +297,16 @@ async fn main(input: Input) -> Result<Output> {
             w_slot.put(&length / page_size);
             w_off.put(&length % page_size);
             page_indptr.put(indptr(1, &page_count));
-            tok_out.put(&greedy(intrinsics::logits()));
+            let r = rng.take();
+            tok_out.put(&pick(&r, temperature, top_p));
+            rng.put(&(&r + iota(2)));
         });
 
         loop {
             fwd.submit(&pipe).context("decode submit")?;
             let token = tok_out.take_host::<i32>().await.context("decode drain")?;
+            picked.push(token as u32);
+            let token = forced(generated.len(), token);
             generated.push(token as u32);
             if generated.len() >= max_tokens {
                 break;
@@ -255,6 +319,7 @@ async fn main(input: Input) -> Result<Output> {
     Ok(Output {
         count: generated.len(),
         text: model::decode(&generated)?,
+        picked,
         tokens: generated,
     })
 }
