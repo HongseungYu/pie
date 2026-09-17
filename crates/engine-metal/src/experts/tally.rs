@@ -97,6 +97,11 @@ pub struct FireRecord {
     /// Device time of final frames that landed since the previous record:
     /// the fire before this one, in steady decode.
     pub gpu_tail_ms: f64,
+    /// Wall clock as this fire opened, ms since the load's first fire. The
+    /// step a decode takes is the gap between two of these, which is the
+    /// only way to read a step off one request rather than by subtracting
+    /// one request's wall time from another's.
+    pub t_ms: f64,
 }
 
 type FireLog = std::sync::Mutex<(u64, std::io::BufWriter<std::fs::File>)>;
@@ -112,7 +117,7 @@ pub(super) fn open_log(path: Option<&std::path::Path>) {
         let _ = writeln!(
             file,
             "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms,\
-             gpu_cut_ms,gpu_tail_ms"
+             gpu_cut_ms,gpu_tail_ms,t_ms"
         );
         let _ = file.flush();
         Some(std::sync::Mutex::new((0, file)))
@@ -134,7 +139,7 @@ pub fn log_fire(record: &FireRecord) {
     let (seq, file) = &mut *log;
     let _ = writeln!(
         file,
-        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
         record.rows,
         record.cuts,
         record.copies,
@@ -147,6 +152,7 @@ pub fn log_fire(record: &FireRecord) {
         record.walk_ms,
         record.gpu_cut_ms,
         record.gpu_tail_ms,
+        record.t_ms,
     );
     let _ = file.flush();
     *seq += 1;
@@ -183,6 +189,9 @@ pub(super) struct Tally {
     pub(super) gpu_ns: u64,
     /// Device time of the fires' final frames, summed as they land.
     pub(super) tail_ns: u64,
+    /// When the load's first fire opened, and when this one did.
+    first: Option<std::time::Instant>,
+    at_ms: f64,
     pub(super) prediction: Prediction,
     fires: u64,
     report_every: u64,
@@ -212,9 +221,16 @@ impl Tally {
         }
     }
 
-    /// A fire opens: what it does is what these counters move by.
+    /// A fire opens: what it does is what these counters move by, and when
+    /// it opened is what says how long the one before it took.
     pub(super) fn open(&mut self) {
         self.at = self.mark();
+        self.at_ms = self
+            .first
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
+            * 1e3;
     }
 
     /// A fire closes: its own slice, and one more fire on the count.
@@ -235,6 +251,7 @@ impl Tally {
             walk_ms: walk.as_secs_f64() * 1e3,
             gpu_cut_ms: (self.gpu_ns - at.gpu_ns) as f64 / 1e6,
             gpu_tail_ms: (self.tail_ns - at.tail_ns) as f64 / 1e6,
+            t_ms: self.at_ms,
         }
     }
 
