@@ -71,3 +71,11 @@ The first report of this run claimed the last-512 figure fell from 109 to
 them. That was wrong twice over: the hit rate did not move, and a later run
 of functionally identical code (the cleanup gate) read 122.24 ms for the
 same figure. See issue 13.
+
+2026-09-17, the measurement that answers for this change. Three reps of the
+same build at each of two knobs: 4000 seats (10.30 GiB) gives `T(1024)` of
+148.0 / 132.4 / 132.6 s at a 67.8% hit rate; 5024 seats (12.94 GiB, the
+memory the old reserved-ring build took at knob 4000) gives 122.2 / 122.4 /
+128.0 s at 72.6%. Against the baseline's 140.5 s and 66% at that same
+memory, borrowing the ring is worth about 13% end to end, because the 1024
+seats it used to reserve are seats a decode can now hit. Table in issue 13.

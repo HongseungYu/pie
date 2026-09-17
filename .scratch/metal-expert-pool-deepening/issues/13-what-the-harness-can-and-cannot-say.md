@@ -47,10 +47,41 @@ since, inside 1.5%.
 - Never `step_ms_last_half` on its own, and never `step_ms_mean` across
   builds without the raw `T` values beside it.
 
+## The comparison that was missing
+
+Every gate above ran at `PIE_EXPERT_CACHE=4000`, but that knob does not
+mean the same thing before and after issue 05. It used to buy 4000 pool
+seats *plus* a reserved ring of 1024 (12.94 GiB); it now buys 4000 seats
+total, of which a prefill borrows 1024 and gives them back (10.30 GiB). The
+runs were comparing different amounts of device memory.
+
+Three reps of each, same build (the cleanup commit), heater on:
+
+| knob | memory | T(1024) per rep | hit rate | disk |
+|---|---|---|---|---|
+| 4000 | 10.30 GiB | 148.0 / 132.4 / 132.6 | 67.8% | 2497 GiB |
+| 5024 | 12.94 GiB | 122.2 / 122.4 / 128.0 | 72.6% | 2184 GiB |
+
+At the memory the old build used at knob 4000, this build wants knob 5024,
+and there it holds 72.6% of its routes against the baseline's 66% and runs
+`T(1024)` at about 122.4 s against the baseline's 140.5 s. The reserved
+ring's 1024 seats were memory no decode could ever hit; borrowed, they are
+seats the decode uses between prefills, and a prefill gives them back
+holding the last two layers it read. That is the change's win, and it is
+worth about 13% end to end at equal memory — not the step figures first
+quoted.
+
+At the same knob instead of the same memory, the trade reads the other way
+and honestly: 2.64 GiB less memory for 1024 fewer usable seats, 132.6 s
+against 140.5 s.
+
+The first rep of a run can be an outlier (148.0 above): quote the median of
+three, or at least two agreeing reps.
+
 ## What the branch actually did to the numbers
 
-`T(1024)` 140.5 -> 133.3 at issue 02, flat since. Hit rate 67.8-67.9%
-throughout. Disk 931 -> 943 GiB at issue 05, because a borrowed ring finds
-fewer experts already seated to copy from. The memory at one knob fell
-12.94 -> 10.30 GiB. Correctness held everywhere: every run decoded the
-recorded teacher-forced tokens exactly.
+At one knob: `T(1024)` 140.5 -> 133.3 at issue 02, flat since, with the
+memory falling 12.94 -> 10.30 GiB at issue 05. At one memory: 140.5 ->
+122.4 s and 66% -> 72.6% of routes held, which is the borrowed ring paying
+for itself. Correctness held everywhere: every run decoded the recorded
+teacher-forced tokens exactly.
