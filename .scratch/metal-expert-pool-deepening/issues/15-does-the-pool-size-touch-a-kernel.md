@@ -33,8 +33,27 @@ it is not a per-miss device cost: 1221 more misses there move the same
 kernel by 0.2 ms, where a per-miss cost of the batch-1 size would have cost
 12 ms. It is more likely clock or thermal drift between two runs.
 
-So: **a miss is host time.** The step is the kernels plus what the host
-spends reading, and the pool's size moves only the second term.
+So over that range **a miss is host time**: the step is the kernels plus
+what the host spends reading, and the pool's size moves the second term.
+
+**Corrected 2026-09-17, after measuring a pool that barely misses.** Over a
+wider range it does touch the device, and the batch-1 gap above was not
+drift after all. The frames' own device time a step, batch 1, against the
+misses that step took:
+
+| misses a step | 0 | 20.2 | 96.3 | 118.2 | 141.7 | 173.2 | 263.7 |
+|---|---|---|---|---|---|---|---|
+| device ms | 30.59 | 34.88 | 40.22 | 40.88 | 41.52 | 42.17 | 43.08 |
+
+Not a line: it climbs steeply from no misses, then settles near 43 ms past
+about 150. The more of a step the device spends idle waiting on a read, the
+lower its clock runs, heater or no heater, and past some idle fraction
+there is no further to fall. Batch 4 sees none of it (84.10 against 84.08
+across 3.7x the misses) because four sequences keep the device busy enough
+that the clock never sags.
+
+So the launch counts are pool-independent, as claimed, but the *time* is
+not: read `compute_ms` as a function of the miss rate, saturating.
 
 ## What the batch changes, which is a different question
 
