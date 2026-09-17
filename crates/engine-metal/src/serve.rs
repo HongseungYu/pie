@@ -306,6 +306,8 @@ pub struct Shell {
     /// when the tier has no ring.
     ring_min: u32,
     expert_fires: std::cell::Cell<u64>,
+    /// Fires between two `expert-cache:` lines on stderr, off the plan.
+    expert_report_every: u64,
     /// Device time of the fires' final frames, summed as they land.
     gpu_tail_ns: std::cell::Cell<u64>,
     held: Vec<u32>,
@@ -490,7 +492,10 @@ impl Shell {
         weights.relabel_conv_weights(&device, &handles, &boot.trace)?;
         handles.seal();
         if weights.tier().is_some() {
-            eprintln!("engine-metal: {}", crate::device::heater::start(&device));
+            eprintln!(
+                "engine-metal: {}",
+                crate::device::heater::start(&device, boot.residency.heater())
+            );
         }
 
         {
@@ -509,7 +514,7 @@ impl Shell {
             // Seat copies that bypass the page cache (`F_NOCACHE`, the
             // default) read SSD -> seat and hold no second copy in RAM, so
             // the squeeze below has nothing to squeeze.
-            let source = if crate::experts::nocache() {
+            let source = if boot.residency.uncached() {
                 0
             } else {
                 boot.residency.source_bytes()
@@ -970,6 +975,7 @@ impl Shell {
             run_caps,
             ring_min,
             expert_fires: std::cell::Cell::new(0),
+            expert_report_every: boot.residency.report_every(),
             gpu_tail_ns: std::cell::Cell::new(0),
             held: vec![0; boot.slots as usize],
             out,
@@ -4187,7 +4193,7 @@ impl engine::frame::Shell for Shell {
                 }
                 let fires = self.expert_fires.get() + 1;
                 self.expert_fires.set(fires);
-                let every = crate::experts::report_every();
+                let every = self.expert_report_every;
                 if every > 0
                     && fires.is_multiple_of(every)
                     && let Some(report) = self.expert_cache_report()

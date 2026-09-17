@@ -17,8 +17,8 @@ mod trace;
 
 use plan::gib;
 pub use plan::{
-    BandPlan, CACHE_ENV, HEADROOM_ENV, LOG_ENV, NOCACHE_ENV, PREFILL_ENV, Plan, Policy, REPORT_ENV,
-    RegionPlan, free_ram, nocache, parse_bytes, policy, prefill_min, report_every, uncached,
+    BandPlan, CACHE_ENV, HEADROOM_ENV, Knobs, LOG_ENV, NOCACHE_ENV, PREFILL_ENV, Plan, Policy,
+    REPORT_ENV, RegionPlan, free_ram, parse_bytes, uncached,
 };
 use source::Bytes;
 pub use source::Source;
@@ -228,6 +228,7 @@ impl Tier {
     }
 
     pub fn open(plan: &Plan, store: &Store, source: Source, offsets: &[u64]) -> Result<Tier> {
+        tally::open_log(plan.knobs.log.as_deref());
         let mut tier = Tier {
             store: store.clone(),
             source,
@@ -318,7 +319,7 @@ impl Tier {
             .and_then(|file| file.try_clone().ok())
             .map(std::sync::Arc::new);
         if let (Some(file), Bytes::Artifact(_)) = (&tier.file, &tier.source.bytes)
-            && nocache()
+            && plan.uncached()
             && !uncached(file)
         {
             // The seats ARE the copy the engine reads; a second copy of every

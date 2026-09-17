@@ -51,31 +51,82 @@ const PREFILL_FLOOR: u32 = 32;
 
 const DEFAULT_REPORT_EVERY: u64 = 256;
 
-/// Rows in one lane from which a fire counts as prefill and runs its routed
-/// matmuls over the ring (a whole layer at a time, filled one layer ahead).
-/// `PIE_EXPERT_CACHE_PREFILL=<rows>` states it, `=0` drops the ring.
-#[must_use]
-pub fn prefill_min(experts: u32, top_k: u32) -> u32 {
-    let derived = (PREFILL_UNION * experts)
-        .div_ceil(top_k.max(1))
-        .max(PREFILL_FLOOR);
-    match std::env::var(PREFILL_ENV) {
-        Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
-            "0" | "off" | "false" | "no" => 0,
-            other => other.parse::<u32>().unwrap_or(derived),
-        },
-        Err(_) => derived,
+/// Every knob this crate takes from the environment for the expert pool,
+/// read once at the load's edge and carried from there: `Plan::under` and
+/// `Tier::open` are functions of what they are handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Knobs {
+    pub(super) policy: Policy,
+    /// `PIE_EXPERT_CACHE_PREFILL`: `None` derives the row count from the
+    /// group's shape, `Some(0)` drops the ring.
+    pub(super) prefill: Option<u32>,
+    /// `PIE_EXPERT_CACHE_NOCACHE`: reads bypass the page cache unless off.
+    pub(super) nocache: bool,
+    /// `PIE_EXPERT_CACHE_REPORT`: fires between two `expert-cache:` lines on
+    /// stderr; 0 leaves only the shutdown line.
+    pub(super) report_every: u64,
+    /// `PIE_EXPERT_CACHE_LOG`: where the per-fire CSV lands.
+    pub(super) log: Option<std::path::PathBuf>,
+    /// `PIE_METAL_HEATER`: the clock heater's `(MiB, in flight)`.
+    pub(super) heater: Option<(u64, usize)>,
+}
+
+impl Default for Knobs {
+    fn default() -> Knobs {
+        Knobs::under(Policy::Off)
     }
 }
 
-/// Fires between one `expert-cache:` line on stderr and the next; 0 leaves
-/// only the shutdown line. `PIE_EXPERT_CACHE_REPORT=<n>`.
-#[must_use]
-pub fn report_every() -> u64 {
-    std::env::var(REPORT_ENV)
-        .ok()
-        .and_then(|word| word.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_REPORT_EVERY)
+impl Knobs {
+    /// The environment's answer for every knob, over the configured budget.
+    pub fn of(budget: Option<u64>) -> Result<Knobs> {
+        Ok(Knobs {
+            policy: policy(budget)?,
+            prefill: match std::env::var(PREFILL_ENV) {
+                Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
+                    "0" | "off" | "false" | "no" => Some(0),
+                    // a word that is not a row count derives, as silence does
+                    other => other.parse::<u32>().ok(),
+                },
+                Err(_) => None,
+            },
+            nocache: !matches!(
+                std::env::var(NOCACHE_ENV).as_deref().map(str::trim),
+                Ok("0" | "off" | "false" | "no")
+            ),
+            report_every: std::env::var(REPORT_ENV)
+                .ok()
+                .and_then(|word| word.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_REPORT_EVERY),
+            log: std::env::var_os(LOG_ENV).map(std::path::PathBuf::from),
+            heater: crate::device::heater::wanted(),
+        })
+    }
+
+    /// This policy and the default of every other knob: the arm that reads
+    /// nothing, which is what tests and the budget-only plans take.
+    #[must_use]
+    pub fn under(policy: Policy) -> Knobs {
+        Knobs {
+            policy,
+            prefill: None,
+            nocache: true,
+            report_every: DEFAULT_REPORT_EVERY,
+            log: None,
+            heater: None,
+        }
+    }
+
+    /// Rows in one lane from which a fire counts as prefill and runs its
+    /// routed matmuls over the ring (a whole layer at a time, filled one
+    /// layer ahead).
+    fn prefill_min(&self, experts: u32, top_k: u32) -> u32 {
+        self.prefill.unwrap_or_else(|| {
+            (PREFILL_UNION * experts)
+                .div_ceil(top_k.max(1))
+                .max(PREFILL_FLOOR)
+        })
+    }
 }
 
 /// Ask the kernel to serve reads through `file` from the disk, not the page
@@ -99,22 +150,11 @@ pub fn uncached(file: &std::fs::File) -> bool {
     }
 }
 
-/// Whether the load's reads bypass the page cache (`F_NOCACHE`): the planes
-/// landed at load and every seat copy after. On unless
-/// `PIE_EXPERT_CACHE_NOCACHE=0`.
-#[must_use]
-pub fn nocache() -> bool {
-    !matches!(
-        std::env::var(NOCACHE_ENV).as_deref().map(str::trim),
-        Ok("0" | "off" | "false" | "no")
-    )
-}
-
 const DEFAULT_HEADROOM: u64 = 4 << 30;
 
 /// The policy this process runs under: the environment first, then the
 /// configured budget, then `Auto`.
-pub fn policy(budget: Option<u64>) -> Result<Policy> {
+fn policy(budget: Option<u64>) -> Result<Policy> {
     let headroom = match std::env::var(HEADROOM_ENV) {
         Ok(word) => parse_bytes(&word).ok_or_else(|| {
             Fault::Residency(format!(
@@ -221,6 +261,7 @@ pub struct Plan {
     pub(super) per_slot: u64,
     pub(super) pairs: u64,
     pub(super) policy: String,
+    pub(super) knobs: Knobs,
     pub(super) device_bytes: u64,
     pub(super) host_bytes: u64,
     pub(super) gathered: crate::gather::Plan,
@@ -255,7 +296,12 @@ impl Plan {
             Some(budget) => Policy::Budget(budget),
             None => Policy::Off,
         };
-        Plan::under(trace, planes, policy, crate::gather::Plan::default())
+        Plan::under(
+            trace,
+            planes,
+            Knobs::under(policy),
+            crate::gather::Plan::default(),
+        )
     }
 
     /// The plan a load runs under: the environment's policy over the
@@ -266,15 +312,16 @@ impl Plan {
         budget: Option<u64>,
         gathered: crate::gather::Plan,
     ) -> Result<Plan> {
-        Plan::under(trace, planes, policy(budget)?, gathered)
+        Plan::under(trace, planes, Knobs::of(budget)?, gathered)
     }
 
     pub fn under(
         trace: &Trace,
         planes: &Attachments,
-        policy: Policy,
+        knobs: Knobs,
         gathered: crate::gather::Plan,
     ) -> Result<Plan> {
+        let policy = knobs.policy;
         let held = gathered.params();
         let bytes = crate::weights::plane_bytes(trace)?;
         let full: u64 = bytes
@@ -287,6 +334,7 @@ impl Plan {
             device_bytes: full,
             gathered: gathered.clone(),
             policy: word.to_string(),
+            knobs: knobs.clone(),
             ..Plan::default()
         };
         match policy {
@@ -379,7 +427,7 @@ impl Plan {
             .max(1);
         let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
         let experts = groups[0].experts;
-        let prefill_min = prefill_min(experts, fan);
+        let prefill_min = knobs.prefill_min(experts, fan);
         // The prefill ring: two whole layers of seats past the pool's own.
         let ring = if prefill_min > 0 { 2 * experts } else { 0 };
         let ceiling = u32::try_from(pairs).unwrap_or(u32::MAX).max(need);
@@ -491,6 +539,7 @@ impl Plan {
         }
         Ok(Plan {
             device_bytes: dense + seats(slots + ring),
+            knobs,
             bands,
             groups,
             regions,
@@ -559,6 +608,26 @@ impl Plan {
     }
 
     /// Rows in one lane from which a fire takes the ring.
+    /// Whether this load's reads bypass the page cache (`F_NOCACHE`): the
+    /// planes landed at load and every seat copy after.
+    #[must_use]
+    pub fn uncached(&self) -> bool {
+        self.knobs.nocache
+    }
+
+    /// Fires between two `expert-cache:` lines on stderr; 0 leaves only the
+    /// shutdown line.
+    #[must_use]
+    pub fn report_every(&self) -> u64 {
+        self.knobs.report_every
+    }
+
+    /// The clock heater this load asks for, as `(MiB, in flight)`.
+    #[must_use]
+    pub fn heater(&self) -> Option<(u64, usize)> {
+        self.knobs.heater
+    }
+
     #[must_use]
     pub fn prefill_min(&self) -> u32 {
         self.prefill_min

@@ -42,7 +42,7 @@ static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 /// What the environment asks for: `(MiB, in flight)`, or `None` for off,
 /// which is what an unset `PIE_METAL_HEATER` means.
 #[must_use]
-pub fn wanted() -> Option<(u64, usize)> {
+pub(crate) fn wanted() -> Option<(u64, usize)> {
     let mib = match std::env::var(ENV) {
         Ok(word) => match word.trim().to_ascii_lowercase().as_str() {
             "0" | "off" | "false" | "no" => return None,
@@ -211,8 +211,8 @@ mod apple {
 }
 
 /// Start the heater thread for this process, once. Says what it did.
-pub fn start(device: &super::Context) -> String {
-    let Some((mib, inflight)) = wanted() else {
+pub fn start(device: &super::Context, wanted: Option<(u64, usize)>) -> String {
+    let Some((mib, inflight)) = wanted else {
         return format!("heater off (`{ENV}=<MiB>` holds the clock up through long reads)");
     };
     if SHARED.get().is_some() {

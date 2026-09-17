@@ -855,7 +855,7 @@ fn warm(
     // the pages); no plane is bound out of it, and nothing below touches a
     // page of it, so the load leaves the page cache as it found it.
     let map = Mapping::of(path).map_err(|why| Some(why.to_string()))?;
-    if crate::experts::nocache() && !crate::experts::uncached(map.file()) {
+    if plan.uncached() && !crate::experts::uncached(map.file()) {
         eprintln!(
             "engine-metal: F_NOCACHE on {} was refused; its planes land through the page cache",
             path.display()

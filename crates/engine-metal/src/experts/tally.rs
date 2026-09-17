@@ -101,12 +101,14 @@ pub struct FireRecord {
 
 type FireLog = std::sync::Mutex<(u64, std::io::BufWriter<std::fs::File>)>;
 
-fn fire_log() -> Option<&'static FireLog> {
-    static LOG: std::sync::OnceLock<Option<FireLog>> = std::sync::OnceLock::new();
-    LOG.get_or_init(|| {
+static LOG: std::sync::OnceLock<Option<FireLog>> = std::sync::OnceLock::new();
+
+/// Open the per-fire CSV the load asked for (`PIE_EXPERT_CACHE_LOG`), once.
+/// Until this runs, and when it is handed nothing, `log_fire` writes nowhere.
+pub(super) fn open_log(path: Option<&std::path::Path>) {
+    let _ = LOG.get_or_init(|| {
         use std::io::Write;
-        let path = std::env::var_os(LOG_ENV)?;
-        let mut file = std::io::BufWriter::new(std::fs::File::create(&path).ok()?);
+        let mut file = std::io::BufWriter::new(std::fs::File::create(path?).ok()?);
         let _ = writeln!(
             file,
             "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms,\
@@ -114,8 +116,11 @@ fn fire_log() -> Option<&'static FireLog> {
         );
         let _ = file.flush();
         Some(std::sync::Mutex::new((0, file)))
-    })
-    .as_ref()
+    });
+}
+
+fn fire_log() -> Option<&'static FireLog> {
+    LOG.get()?.as_ref()
 }
 
 pub fn log_fire(record: &FireRecord) {
