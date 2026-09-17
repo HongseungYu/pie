@@ -88,3 +88,15 @@ fits at 9216 with the ring's 1024 to spare; 48 leaves margin), and every `steps`
 the whole 1024-token sequence first. The floor is 38.6 ms, not the 43-45 of the earlier
 11204-seat runs, whose extra was page faults: C = 33.4 (cut frames 30.3 + final frame
 3.0), F = 5.2 (turnaround 3.9, seating 0.2, n-gram rows 0.1, encode 0.8, after the walk 0.3).
+
+## Correction (2026-09-17 19:20): 9216 is not stable; 8192 is
+
+The three zero-miss reps at 9216 (`sm-c3-n48-a/b/c`) found their n-gram rows evicted again
+between the prime and the resident pass: `ple_ms` 5.96 / 5.13 / 10.75 in the resident passes
+(falling to 0.1 only in a pass's last steps), steps 42.8 / 41.9 / 47.6. `sm-d4-head-s9216`'s
+0.09 was luck: `sm-d3-head-s8192` had warmed the same rows a minute before and they survived
+one more prefill. At 8192 seats both `sm-d1-tail-s8192` (128 tokens) and `sm-d3-head-s8192`
+(64) kept them (0.06, 0.03). So the pool is **8192 seats** (21.6 GiB of seats), and the
+zero-miss window **40 tokens** (48 steps' union with the two ring borrows is tight at 8192:
+`sm-d3` at 64 lost the earliest steps' experts to the borrow). The Phase 3 launcher checks
+the c3 reps' resident `ple_ms` before spending the hour.

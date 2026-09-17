@@ -48,8 +48,8 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 5 | Windows: mean of the last 256 steps (median, p10, p90 beside it), two fresh-server runs. | Issue 13: the harness's differenced figures are not measurements of a step. |
 | 6 | Records: `spec.md`, `issues/NN-*.md` one per experiment, `RESULTS.md` the final table; run tags `sm-*` in `out/`. | Traceable later. |
 | 7 | The heater is `alu` 1024 x 8192, two in flight, armed at every gap (issue 02). | Cut frames 29.7 at no misses, 31.5 at 331; every other shape loses on one end. |
-| 8 | "Largest pool" is 9216 seats, not the 11204 that boots: above it the OS evicts the n-gram table's pages and every step pays ~6 ms of faults (issue 05). | An operating-system cost no fixed F can carry. |
-| 9 | Zero-miss windows are 48 tokens, three reps; `steps` runs warm the whole sequence first. | What 9216 seats hold of the head; the page cache. |
+| 8 | "Largest pool" is 8192 seats, not the 11204 that boots: from 9216 up the OS evicts the n-gram table's pages between requests and a step pays ~6 ms of faults (issue 05). | An operating-system cost no fixed F can carry. |
+| 9 | Zero-miss windows are 40 tokens, three reps; `steps` runs warm the whole sequence first. | What 8192 seats hold of the head beside two ring borrows; the page cache. |
 
 ## Plan
 
