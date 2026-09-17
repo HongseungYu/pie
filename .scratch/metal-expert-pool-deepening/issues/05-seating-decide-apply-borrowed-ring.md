@@ -52,3 +52,13 @@ returned seats are hits a decode can take. `Shell.ring_min`,
 `Prepared.whole`, `Cuts.whole` and `segment`'s `whole` argument are gone.
 
 Gate: clippy --all-targets clean, lib tests 20 passed.
+
+2026-09-17, harness gate (clean mode, 4000 seats, heater on, 1k prompt,
+1024 teacher-forced tokens): every forced-token assertion passed. Step
+118.10 ms mean (8.47 tok/s) and 80.28 ms over the last 512 (12.46 tok/s),
+against 119.78 / 96.70 ms at issue 04 and RESULTS.md's 130.40 ms baseline;
+decode hit rate 67.8% over the whole run, unchanged, but the seats the
+ring gives back turn the tail of a long decode markedly cheaper. The boot
+line reads `4000 seats ... 10.30 GiB ... 1024 of which a prefill fire
+borrows`: the same knob now costs 2.64 GiB less than when the ring was
+reserved beside the pool.
