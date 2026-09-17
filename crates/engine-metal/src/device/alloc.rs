@@ -33,14 +33,12 @@ pub(crate) fn slab_address(slab: &Slab) -> u64 {
 pub struct Buffer {
     slab: Slab,
     bytes: u64,
-    keep: Option<std::sync::Arc<crate::mapping::Mapping>>,
 }
 
 impl std::fmt::Debug for Buffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
             .field("bytes", &self.bytes)
-            .field("mapped", &self.keep.is_some())
             .finish()
     }
 }
@@ -57,15 +55,10 @@ impl Buffer {
                 return Ok(Buffer {
                     slab: device.empty(),
                     bytes: 0,
-                    keep: None,
                 });
             }
             let slab = device.reserve(bytes)?;
-            let mut buffer = Buffer {
-                slab,
-                bytes,
-                keep: None,
-            };
+            let mut buffer = Buffer { slab, bytes };
             buffer.zero_span(0, bytes)?;
             Ok(buffer)
         }
@@ -74,102 +67,6 @@ impl Buffer {
             let _ = (device, bytes);
             Err(Fault::Deviceless)
         }
-    }
-
-    pub fn mapped(
-        device: &super::Context,
-        map: std::sync::Arc<crate::mapping::Mapping>,
-    ) -> Result<Buffer> {
-        let whole = crate::mapping::Cut::whole(&map);
-        Buffer::window(device, map, whole)
-    }
-
-    pub fn window(
-        device: &super::Context,
-        map: std::sync::Arc<crate::mapping::Mapping>,
-        cut: crate::mapping::Cut,
-    ) -> Result<Buffer> {
-        #[cfg(target_vendor = "apple")]
-        {
-            let end = cut.base().checked_add(cut.span());
-            if end.is_none_or(|end| end > map.span()) {
-                return Err(Fault::Mapped {
-                    step: "bind",
-                    what: map.path().display().to_string(),
-                    why: format!(
-                        "a window of [{}, {}) leaves a mapping of {} bytes",
-                        cut.base(),
-                        cut.base().saturating_add(cut.span()),
-                        map.span(),
-                    ),
-                });
-            }
-            // SAFETY: `Mapping` is a page-aligned live `mmap` of `span()`
-            // bytes, matching what `newBufferWithBytesNoCopy` requires; the
-            // window checked above lies inside it.
-            let at = unsafe { map.base().add(cut.base()) };
-            if crate::diag::on().copy_resident {
-                let started = std::time::Instant::now();
-                let mut owned = Buffer::zeroed(device, cut.span() as u64)?;
-                let threads = std::thread::available_parallelism()
-                    .map_or(4, |n| n.get())
-                    .min(8);
-                let chunk = (cut.span() / threads)
-                    .next_multiple_of(1 << 20)
-                    .max(1 << 20);
-                let dst = owned.slab.contents().as_ptr().cast::<u8>() as usize;
-                let src = at.as_ptr() as usize;
-                std::thread::scope(|scope| {
-                    for t in 0..threads {
-                        let lo = t * chunk;
-                        if lo >= cut.span() {
-                            break;
-                        }
-                        let len = (cut.span() - lo).min(chunk);
-                        scope.spawn(move || {
-                            // SAFETY: disjoint `[lo, lo + len)` windows of two
-                            // live allocations of at least `span` bytes.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    (src + lo) as *const u8,
-                                    (dst + lo) as *mut u8,
-                                    len,
-                                );
-                            }
-                        });
-                    }
-                });
-                if crate::diag::on().tier_trace {
-                    eprintln!(
-                        "load: copied a {:.2} GiB resident window in {:.2} s",
-                        cut.span() as f64 / (1u64 << 30) as f64,
-                        started.elapsed().as_secs_f64()
-                    );
-                }
-                owned.bytes = cut.bytes();
-                return Ok(owned);
-            }
-            let slab = unsafe { device.no_copy(at, cut.span()) }.map_err(|why| Fault::Mapped {
-                step: "bind",
-                what: map.path().display().to_string(),
-                why: why.to_string(),
-            })?;
-            Ok(Buffer {
-                slab,
-                bytes: cut.bytes(),
-                keep: Some(map),
-            })
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            let _ = (device, map, cut);
-            Err(Fault::Deviceless)
-        }
-    }
-
-    #[must_use]
-    pub fn is_mapped(&self) -> bool {
-        self.keep.is_some()
     }
 
     #[must_use]
@@ -199,17 +96,6 @@ impl Buffer {
         }
     }
 
-    fn writable(&self, step: &'static str) -> Result<()> {
-        match &self.keep {
-            None => Ok(()),
-            Some(map) => Err(Fault::Mapped {
-                step,
-                what: map.path().display().to_string(),
-                why: "a reservation served from an artifact's own mapped pages is read-only".into(),
-            }),
-        }
-    }
-
     pub fn write_from_file(
         &mut self,
         file: &std::fs::File,
@@ -223,7 +109,6 @@ impl Buffer {
     /// A copier over this reservation: every job's source and destination
     /// span lies inside it. `FileWriter::copy` moves the bytes.
     pub fn copier(&mut self, jobs: &[(u64, u64, u64)]) -> Result<FileWriter> {
-        self.writable("copy")?;
         for &(into, from, len) in jobs {
             self.span(into, len)?;
             self.span(from, len)?;
@@ -242,7 +127,6 @@ impl Buffer {
     }
 
     pub fn file_writer(&mut self, jobs: &[(u64, u64, u64)]) -> Result<FileWriter> {
-        self.writable("write_from_file")?;
         for &(into, _, len) in jobs {
             self.span(into, len)?;
         }
@@ -367,7 +251,6 @@ impl FileWriter {
 
 impl Buffer {
     pub fn write(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.writable("write")?;
         self.span(offset, bytes.len() as u64)?;
         #[cfg(target_vendor = "apple")]
         {
@@ -391,7 +274,6 @@ impl Buffer {
     }
 
     pub fn zero_span(&mut self, offset: u64, len: u64) -> Result<()> {
-        self.writable("zero_span")?;
         self.span(offset, len)?;
         #[cfg(target_vendor = "apple")]
         {

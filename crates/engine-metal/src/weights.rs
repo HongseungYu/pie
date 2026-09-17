@@ -282,11 +282,6 @@ impl Weights {
     }
 
     #[must_use]
-    pub fn windows(&self) -> usize {
-        0
-    }
-
-    #[must_use]
     pub fn residue(&self) -> (usize, u64) {
         self.residue
     }

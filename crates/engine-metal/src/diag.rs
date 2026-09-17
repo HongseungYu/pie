@@ -56,12 +56,9 @@ pub struct Diagnostics {
     pub nan_check: bool,
 
     pub nan_limit: f32,
-    pub prefault: bool,
-    pub copy_resident: bool,
     pub prefetch_k: Option<usize>,
     pub seat_threads: Option<usize>,
     pub keepalive_iters: Option<u32>,
-    pub window_ceiling: Option<u64>,
     pub streamed_groups: Option<u32>,
     pub streamed_repeat: usize,
     pub streamed_repeat_kind: Option<StreamedKind>,
@@ -87,12 +84,9 @@ impl Default for Diagnostics {
             host_rows: false,
             nan_check: false,
             nan_limit: 3.0e38,
-            prefault: false,
-            copy_resident: false,
             prefetch_k: None,
             seat_threads: None,
             keepalive_iters: None,
-            window_ceiling: None,
             streamed_groups: None,
             streamed_repeat: 1,
             streamed_repeat_kind: None,
@@ -129,9 +123,9 @@ const WORDS: &str = "`cut-trace`, `tier-trace`, `rs-trace`, `fire-trace`, \
      `region-trace`, `streamed-trace`, `kernel-profile[=1|2]`, \
      `nan-check`, `nan-limit=<float>`, `kernel-dump=<dir>`, `route-dump=<file>`, \
      `route-prefetch=off`, `keepalive=off`, \
-     `scratch-no-zero`, `host-rows`, `prefault`, `copy-resident`, \
+     `scratch-no-zero`, `host-rows`, \
      `prefetch-k=<n>`, `seat-threads=<n>`, `keepalive-iters=<n>`, \
-     `window-ceiling=<bytes>`, `streamed-groups=<n>`, `streamed-repeat=<n>`, \
+     `streamed-groups=<n>`, `streamed-repeat=<n>`, \
      `streamed-repeat-kind=<wide|partial|single|reduce|argmax>`, \
      `streamed-limit=<n>`, `streamed-nop=<n>`";
 
@@ -166,8 +160,6 @@ impl std::str::FromStr for Diagnostics {
                         format!("`nan-limit` takes a float magnitude; `{value}` is not one")
                     })?;
                 }
-                "prefault" => diag.prefault = switch(word, value)?,
-                "copy-resident" => diag.copy_resident = switch(word, value)?,
                 "kernel-profile" => {
                     diag.kernel_profile = match value {
                         "" | "1" | "on" | "true" | "yes" => Profile::On,
@@ -217,17 +209,6 @@ impl std::str::FromStr for Diagnostics {
                     diag.seat_threads = Some(threads);
                 }
                 "keepalive-iters" => diag.keepalive_iters = Some(number(word, value)?),
-                "window-ceiling" => {
-                    let bytes: u64 = number(word, value)?;
-                    if bytes == 0 {
-                        return Err(
-                            "`window-ceiling` must be > 0; omit it for the device's own \
-                             `maxBufferLength`"
-                                .to_string(),
-                        );
-                    }
-                    diag.window_ceiling = Some(bytes);
-                }
                 "streamed-groups" => {
                     let groups: u32 = number(word, value)?;
                     if groups == 0 {
@@ -313,7 +294,6 @@ mod tests {
     fn a_number_that_is_not_one_refuses() {
         assert!("prefetch-k=many".parse::<Diagnostics>().is_err());
         assert!("seat-threads=0".parse::<Diagnostics>().is_err());
-        assert!("window-ceiling=0".parse::<Diagnostics>().is_err());
     }
 
     fn the_streamed_kind_takes_one_of_five_words() {

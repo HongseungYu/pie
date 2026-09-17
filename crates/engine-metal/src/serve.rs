@@ -1160,12 +1160,6 @@ impl Shell {
         self.weights.warm()
     }
 
-    #[must_use]
-    pub fn weight_windows(&self) -> usize {
-        self.weights.windows()
-    }
-
-    #[must_use]
     pub fn weights_residue(&self) -> (usize, u64) {
         self.weights.residue()
     }

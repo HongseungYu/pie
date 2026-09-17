@@ -235,7 +235,6 @@ struct Run {
     prefill_ms: f64,
     decode_ms: f64,
     warm: bool,
-    windows: usize,
     kind: Option<&'static str>,
     source: Option<(u64, u64)>,
     motion: (u64, u64),
@@ -310,7 +309,6 @@ fn run(what: &str, artifact: &Path, residency: Plan, prompt: &[u32]) -> Option<R
         prefill_ms,
         decode_ms,
         warm: shell.weights_warm(),
-        windows: shell.weight_windows(),
         kind: shell.expert_source_kind(),
         source: shell.expert_source(),
         motion: shell.expert_motion(),
@@ -388,11 +386,10 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
     let ceiling = engine_metal::device::Context::bind()
         .expect("the device binds")
         .max_buffer();
-    let least = bytes.div_ceil(ceiling);
     eprintln!(
         "maxBufferLength {ceiling} ({:.2} GiB) against an artifact of {bytes} ({:.2} \
-         GiB): one `MTLBuffer` holds {:.1}% of this row, so the mapping binds as at \
-         least {least} window(s) cut at the manifest's own blob boundaries",
+         GiB): one `MTLBuffer` holds {:.1}% of this row, and the planes this load \
+         holds resident are read out of it a seat at a time",
         ceiling as f64 / (1u64 << 30) as f64,
         bytes as f64 / (1u64 << 30) as f64,
         100.0 * ceiling as f64 / bytes as f64,
@@ -408,7 +405,7 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
     for (what, at) in [("run-1", &first), ("run-2", &second)] {
         eprintln!(
             "{what}  load {:>8.0} ms  prefill {:>7.1} ms ({:.1} tok/s)  decode {:>7.1} ms \
-             ({:.1} tok/s)\n       warm={} windows={} source={} {:?} motion={:?} \
+             ({:.1} tok/s)\n       warm={} source={} {:?} motion={:?} \
              slabs={}  wired boot {} first fire {}  swap {}",
             at.load_ms,
             at.prefill_ms,
@@ -416,7 +413,6 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
             at.decode_ms,
             STEPS as f64 / (at.decode_ms / 1000.0),
             at.warm,
-            at.windows,
             at.kind.unwrap_or("none"),
             at.source,
             at.motion,
@@ -433,16 +429,6 @@ fn the_full_dsv4_artifact_loads_warm_streams_its_experts_and_answers_twice_the_s
         first.warm,
         "the {SKU} artifact did not take the warm arm, so this load read 89.9 GiB into \
          a host store on a 32 GiB box rather than mapping it"
-    );
-
-    assert!(
-        first.windows >= least as usize,
-        "the {SKU} artifact bound as {} window(s) against a {ceiling}-byte          `maxBufferLength` and {bytes} bytes of file, which needs at least {least}",
-        first.windows,
-    );
-    assert_eq!(
-        first.windows, second.windows,
-        "two loads of one artifact cut it into different numbers of windows"
     );
 
     assert!(

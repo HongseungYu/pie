@@ -206,40 +206,6 @@ impl Context {
         }
     }
 
-    #[cfg(target_vendor = "apple")]
-    pub(crate) unsafe fn no_copy(
-        &self,
-        at: std::ptr::NonNull<u8>,
-        span: usize,
-    ) -> Result<super::alloc::Slab> {
-        RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let bytes = span as u64;
-        if bytes > self.max_buffer {
-            return Err(Fault::Ceiling {
-                what: "bytes in one buffer",
-                need: bytes,
-                have: self.max_buffer,
-            });
-        }
-        // SAFETY: the caller's contract is exactly this call's — an aligned
-        // live mapping of `span` readable bytes that outlives the buffer —
-        // and a nil deallocator is what leaves the pages theirs.
-        unsafe {
-            self.device
-                .newBufferWithBytesNoCopy_length_options_deallocator(
-                    at.cast::<std::ffi::c_void>(),
-                    span,
-                    MTLResourceOptions::StorageModeShared,
-                    None,
-                )
-                .ok_or(Fault::Device {
-                    call: "newBufferWithBytesNoCopy:length:options:deallocator:",
-                    why: format!("the device declined a zero-copy wrap of {bytes} bytes"),
-                })
-        }
-    }
-
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
     pub(crate) fn empty(&self) -> super::alloc::Slab {
         RESERVATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(target_vendor = "apple")]
