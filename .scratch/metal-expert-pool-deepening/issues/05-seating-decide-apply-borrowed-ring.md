@@ -1,6 +1,6 @@
 # 05 One seating path: decide / apply, borrowed ring, holds, fire hooks
 
-Status: claimed
+Status: resolved
 Type: task
 Blocked by: 04
 
@@ -28,3 +28,27 @@ The deepening proper. ADR-0002.
 
 Gate: check/clippy/lib tests, then one harness decode vs RESULTS.md. Hit
 rate should rise (returned layers hit); step ms must not regress.
+
+## Comments
+
+2026-09-17: done, with one thing left as it was. `segment_rows` and
+`ring_at` are still two functions: they share the pool, the holds, the seat
+table and the fire hooks, but their rhythms differ (seat what this segment
+names, versus hold a whole layer filled a layer ahead), and folding them
+would put a strategy branch inside one function rather than delete one.
+`ring_has`/`ring_join`/`ring_ready`/`ring_fill` stay for the same reason;
+`ring_join` takes `Option<group>` instead of the `usize::MAX` sentinel.
+
+What landed: `Hold` per seat (Free / Segment / Fire / Inflight) replacing
+the boolean pin, each release point clearing only its own kind; `decide`
+(pure over the routing bytes and the pool: takes and holds seats, moves
+nothing) then `land` (copies, then makes resident), with prefetch the same
+path spawned and committed at the join; `Tier::begin_fire` borrowing
+`2 * experts` seats from the pool for a prefill fire and `end_fire`
+returning them at the cold end of the LRU holding the last two layers they
+read; the plan sizing the ring as a floor rather than a reservation, so the
+same `PIE_EXPERT_CACHE` now costs 2.64 GiB less on this model and the
+returned seats are hits a decode can take. `Shell.ring_min`,
+`Prepared.whole`, `Cuts.whole` and `segment`'s `whole` argument are gone.
+
+Gate: clippy --all-targets clean, lib tests 20 passed.

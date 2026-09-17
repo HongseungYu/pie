@@ -417,26 +417,29 @@ impl Plan {
             .max()
             .unwrap_or(1)
             .max(1);
+        let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
+        let experts = groups[0].experts;
+        let prefill_min = knobs.prefill_min(experts, fan);
+        // The prefill ring: two whole layers, borrowed from the pool for the
+        // fire that wants them and given back at its end.
+        let ring = if prefill_min > 0 { 2 * experts } else { 0 };
         // One segment seats every distinct expert it routes to at once, and
-        // that is at most one layer's experts: a segment never runs in passes.
+        // that is at most one layer's experts; a prefill fire holds two whole
+        // layers of them at a time. Either way the pool is the whole of it.
         let need = groups
             .iter()
             .map(|group| group.experts)
             .max()
             .unwrap_or(1)
-            .max(1);
-        let pairs: u64 = groups.iter().map(|group| u64::from(group.experts)).sum();
-        let experts = groups[0].experts;
-        let prefill_min = knobs.prefill_min(experts, fan);
-        // The prefill ring: two whole layers of seats past the pool's own.
-        let ring = if prefill_min > 0 { 2 * experts } else { 0 };
+            .max(1)
+            .max(ring);
         let ceiling = u32::try_from(pairs).unwrap_or(u32::MAX).max(need);
-        // The most seats, ring included, whose bytes fit `usable`.
+        // The most seats whose bytes fit `usable`.
         let largest = |usable: u64| -> u32 {
             let mut n = u32::try_from(usable / seats(1).max(1))
                 .unwrap_or(u32::MAX)
-                .min(ceiling + ring);
-            while n > need + ring && seats(n) > usable {
+                .min(ceiling);
+            while n > need && seats(n) > usable {
                 n -= 1;
             }
             n
@@ -444,9 +447,8 @@ impl Plan {
         let ring_note = || {
             if ring > 0 {
                 format!(
-                    " and a prefill ring of {ring} seats ({:.2} GiB; `{PREFILL_ENV}=0` drops \
-                     it)",
-                    gib(seats(ring))
+                    " ({ring} of them a prefill fire borrows for its ring; \
+                     `{PREFILL_ENV}=0` drops it)"
                 )
             } else {
                 String::new()
@@ -456,7 +458,7 @@ impl Plan {
         let (slots, word) = match policy {
             Policy::Off => return Ok(whole("off: every expert resident")),
             Policy::Budget(budget) => {
-                let floor = dense + seats(need + ring);
+                let floor = dense + seats(need);
                 if budget < floor {
                     return Err(Fault::Residency(format!(
                         "`device_weight_budget` is {budget} bytes; this plan's DENSE planes \
@@ -469,7 +471,7 @@ impl Plan {
                         ring_note(),
                     )));
                 }
-                let slots = largest(budget - dense) - ring;
+                let slots = largest(budget - dense);
                 (slots, format!("budget {:.2} GiB", gib(budget)))
             }
             Policy::Slots(n) => {
@@ -493,7 +495,7 @@ impl Plan {
                 })?;
                 let usable = free.saturating_sub(headroom).saturating_sub(dense);
                 let total = largest(usable);
-                if seats(total) > usable || total < need + ring {
+                if seats(total) > usable || total < need {
                     return Err(Fault::Residency(format!(
                         "free RAM is {:.2} GiB; less the {:.2} GiB headroom and the {:.2} \
                          GiB of dense planes, {:.2} GiB is left, and the pool needs at least \
@@ -508,7 +510,7 @@ impl Plan {
                     )));
                 }
                 (
-                    total - ring,
+                    total,
                     format!(
                         "auto: free {:.2} GiB - headroom {:.2} GiB - dense {:.2} GiB",
                         gib(free),
@@ -526,11 +528,9 @@ impl Plan {
         for group in &mut groups {
             group.slots = slots;
         }
-        // The reservation a band's region is placed at: the pool and the ring.
-        let resident_of = bands
-            .iter()
-            .map(|band| (band.param, slots + ring))
-            .collect();
+        // The reservation a band's region is placed at: the pool, whose
+        // seats a prefill fire borrows from rather than adding to.
+        let resident_of = bands.iter().map(|band| (band.param, slots)).collect();
         let mut host_bytes = 0u64;
         let mut host_of = BTreeMap::new();
         for band in &bands {
@@ -540,7 +540,7 @@ impl Plan {
         let tables =
             (u64::from(experts) * 4).next_multiple_of(crate::weights::ALIGN) * groups.len() as u64;
         Ok(Plan {
-            device_bytes: dense + seats(slots + ring) + tables,
+            device_bytes: dense + seats(slots) + tables,
             knobs,
             bands,
             groups,
@@ -618,7 +618,7 @@ impl Plan {
         self.pairs
     }
 
-    /// Seats past the pool's own that hold the prefill ring (two whole
+    /// Seats of the pool a prefill fire borrows for its ring (two whole
     /// layers), or 0 without one.
     #[must_use]
     pub fn ring(&self) -> u32 {
@@ -692,10 +692,8 @@ impl Plan {
         }
         let ring = if self.ring > 0 {
             format!(
-                " + a prefill ring of {} seats ({:.2} GiB) from {} rows a lane",
-                self.ring,
-                gib(u64::from(self.ring) * self.per_slot),
-                self.prefill_min
+                ", {} of which a prefill fire borrows for its ring from {} rows a lane",
+                self.ring, self.prefill_min
             )
         } else {
             String::new()

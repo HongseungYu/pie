@@ -302,9 +302,6 @@ pub struct Shell {
     cuts: Vec<Option<ValueId>>,
     row_cuts: Vec<Option<ValueId>>,
     run_caps: Vec<u32>,
-    /// Rows in one lane from which a fire is prefill and takes the ring; 0
-    /// when the tier has no ring.
-    ring_min: u32,
     expert_fires: std::cell::Cell<u64>,
     /// Fires between two `expert-cache:` lines on stderr, off the plan.
     expert_report_every: u64,
@@ -458,11 +455,6 @@ impl Shell {
                 }
             })
             .collect();
-        let ring_min = if boot.residency.ring() > 0 {
-            boot.residency.prefill_min()
-        } else {
-            0
-        };
         if crate::diag::on().cut_trace {
             let capped: Vec<(usize, u32)> = run_caps
                 .iter()
@@ -973,7 +965,6 @@ impl Shell {
             cuts,
             row_cuts,
             run_caps,
-            ring_min,
             expert_fires: std::cell::Cell::new(0),
             expert_report_every: boot.residency.report_every(),
             gpu_tail_ns: std::cell::Cell::new(0),
@@ -2578,7 +2569,10 @@ impl Shell {
         let mut descriptor = FireDescriptor::of(&composition);
         // A prefill fire runs its routed matmuls over the ring, which holds
         // every expert of the layer: no row cap for it.
-        let whole = self.ring_min > 0 && lane_rows.iter().any(|&rows| rows >= self.ring_min);
+        let whole = match self.weights.tier() {
+            Some(tier) => tier.borrow_mut().begin_fire(&lane_rows)?,
+            None => false,
+        };
         let run_caps = if whole {
             vec![0; self.run_caps.len()]
         } else {
@@ -3477,7 +3471,6 @@ impl Shell {
         };
 
         Ok(Prepared {
-            whole,
             lanes,
             self_cond_feeds,
             port_feeds,
@@ -3812,7 +3805,6 @@ impl Shell {
                 self.arena.store().clone(),
                 tier,
                 rows,
-                p.whole,
             ),
         ));
         {
@@ -4048,7 +4040,6 @@ pub struct Prepared<'a> {
     caches: CacheTable,
     bindings: FireBindings,
     demand: Demand,
-    whole: bool,
 }
 
 impl PreparedPhase for Prepared<'_> {
@@ -4140,7 +4131,16 @@ impl engine::frame::Shell for Shell {
                     std::time::Instant::now(),
                 )
             });
-            let walked = self.walk_streamed(&prepared)?;
+            let walked = self.walk_streamed(&prepared);
+            // The fire is over however it went: the ring goes back to the
+            // pool before anything else is decided, and a walk that refused
+            // is the fault worth reporting.
+            let ended = match self.weights.tier() {
+                Some(tier) => tier.borrow_mut().end_fire(),
+                None => Ok(()),
+            };
+            let walked = walked?;
+            ended?;
             if let Some((
                 (swaps0, cuts0),
                 (hits0, misses0),

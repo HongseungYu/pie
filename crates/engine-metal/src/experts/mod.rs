@@ -51,11 +51,24 @@ const NONE: u32 = u32::MAX;
 /// recently used at the head, so a victim is the head rather than a scan
 /// over every seat (the scan cost llama.cpp's expert store 4 ms a step at
 /// 11k seats). Seats never used yet wait on `free` and go first.
+/// What keeps a seat from being taken, and who lets it go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// Nothing: the LRU may hand it out.
+    Free,
+    /// A matmul of the segment just cut reads it; the next cut releases it.
+    Segment,
+    /// This fire borrowed it for its prefill ring; the fire's end returns it.
+    Fire,
+    /// A copy is landing in it; the join that takes the copy releases it.
+    Inflight,
+}
+
 #[derive(Debug)]
 struct Pool {
     slots: u32,
     in_seat: Vec<Option<(u32, u32)>>,
-    pinned: Vec<bool>,
+    holds: Vec<Hold>,
     prev: Vec<u32>,
     next: Vec<u32>,
     linked: Vec<bool>,
@@ -69,7 +82,7 @@ impl Pool {
         Pool {
             slots,
             in_seat: vec![None; slots as usize],
-            pinned: vec![false; slots as usize],
+            holds: vec![Hold::Free; slots as usize],
             prev: vec![NONE; slots as usize],
             next: vec![NONE; slots as usize],
             linked: vec![false; slots as usize],
@@ -114,6 +127,21 @@ impl Pool {
         self.linked[s] = true;
     }
 
+    /// Least recently used, now: the next miss takes it.
+    fn push_front(&mut self, seat: u32) {
+        let s = seat as usize;
+        debug_assert!(!self.linked[s], "a seat is on the list once");
+        self.next[s] = self.head;
+        self.prev[s] = NONE;
+        if self.head == NONE {
+            self.tail = seat;
+        } else {
+            self.prev[self.head as usize] = seat;
+        }
+        self.head = seat;
+        self.linked[s] = true;
+    }
+
     /// Most recently used, now.
     fn bump(&mut self, seat: u32) {
         self.unlink(seat);
@@ -121,14 +149,14 @@ impl Pool {
     }
 
     /// A seat to take: one never used, else the least recently used seat
-    /// no one has pinned this segment.
+    /// nothing holds.
     fn victim(&mut self) -> Option<u32> {
         if let Some(seat) = self.free.pop() {
             return Some(seat);
         }
         let mut at = self.head;
         while at != NONE {
-            if !self.pinned[at as usize] {
+            if self.holds[at as usize] == Hold::Free {
                 return Some(at);
             }
             at = self.next[at as usize];
@@ -136,22 +164,49 @@ impl Pool {
         None
     }
 
+    fn hold(&mut self, seat: u32, hold: Hold) {
+        self.holds[seat as usize] = hold;
+    }
+
+    /// Let go of every seat held this way, and only those: a segment's pins
+    /// fall at the next cut without dropping the fire's borrowed ring.
+    fn release(&mut self, hold: Hold) {
+        for held in &mut self.holds {
+            if *held == hold {
+                *held = Hold::Free;
+            }
+        }
+    }
+
+    /// Take a seat back for reuse: nothing sits in it and nothing holds it.
+    fn strip(&mut self, seat: u32) {
+        self.in_seat[seat as usize] = None;
+        self.holds[seat as usize] = Hold::Free;
+        self.unlink(seat);
+        self.free.push(seat);
+    }
+
     fn resident(&self) -> u64 {
         self.in_seat.iter().filter(|held| held.is_some()).count() as u64
     }
 }
 
-/// Two full-layer buffers past the pool's seats, for prefill. A fire in
-/// which some lane has `min_rows` rows or more names nearly every expert of
-/// every layer, so its routed matmuls run over a buffer holding the whole
-/// layer (seat = `base + half * experts + expert`, the LRU untouched), and
-/// the next layer's buffer fills while this one computes: experts the pool
-/// holds are copied from their seats, the rest are read. After llama.cpp's
-/// expert store (`TAG_MOE_STORE_PREFILL`) and FreeToken's prefill.
+/// Two whole layers of seats, borrowed from the pool for one prefill fire.
+/// A fire in which some lane has `min_rows` rows or more names nearly every
+/// expert of every layer, so its routed matmuls run over a half holding the
+/// whole layer while the next layer fills the other: experts the pool holds
+/// are copied from their seats, the rest are read. The fire takes the two
+/// halves at its start and gives them back at its end holding the last two
+/// layers it read, so the damage to the working set is those `2 * experts`
+/// seats whatever the layer count. After llama.cpp's expert store
+/// (`TAG_MOE_STORE_PREFILL`) and FreeToken's prefill.
 #[derive(Debug)]
 struct Ring {
-    base: u32,
     experts: u32,
+    /// The seats this fire borrowed, `2 * experts` of them: half `h` holds
+    /// `seats[h * experts ..][.. experts]`, one seat per expert of the layer
+    /// that half was filled with. Empty between prefill fires.
+    seats: Vec<u32>,
     holds: [Option<usize>; 2],
     filling: Option<(usize, usize, std::thread::JoinHandle<Result<()>>)>,
     fills: u64,
@@ -164,6 +219,14 @@ struct Ring {
 
 type Job = (u64, u64, u64);
 
+/// What a cut decided: the copies a segment's seats are waiting on, and the
+/// `(group, seat, expert)` each one makes resident once it has landed.
+#[derive(Debug, Default)]
+struct Seating {
+    jobs: Vec<Job>,
+    landing: Vec<(usize, u32, u32)>,
+}
+
 #[derive(Debug)]
 pub struct Tier {
     store: Store,
@@ -175,7 +238,13 @@ pub struct Tier {
     swaps: u64,
     segments: u64,
     threads: usize,
-    pending: Vec<(usize, u32, u32)>,
+    /// What the read in flight will make resident once it lands.
+    landing: Vec<(usize, u32, u32)>,
+    /// Rows in one lane from which a fire is a prefill one and takes the
+    /// ring; 0 when this load has no ring.
+    prefill_min: u32,
+    /// Whether the fire open now is a prefill one, holding the ring.
+    whole: bool,
     hits: u64,
     misses: u64,
     bytes_read: u64,
@@ -212,15 +281,15 @@ const SEAT_THREADS: usize = 16;
 impl Tier {
     /// Say where group `at`'s experts sit, so the matmuls that follow this
     /// cut read the seats the tier landed them in. `seat_of` answers for a
-    /// pool segment; a ring segment holds the whole layer in one run from
-    /// `first`. An expert this segment does not route to is written as seat
+    /// pool segment; a ring segment reads the half it was filled into, one
+    /// borrowed seat per expert. An expert this segment does not route to is written as seat
     /// zero and never read: only the experts a row names are looked up.
-    fn say_seats(&mut self, at: usize, first: Option<u32>) -> Result<()> {
+    fn say_seats(&mut self, at: usize, half: Option<&[u32]>) -> Result<()> {
         let experts = self.groups[at].experts as usize;
         let mut table = Vec::with_capacity(experts * 4);
         for expert in 0..experts {
-            let seat = match first {
-                Some(first) => first + expert as u32,
+            let seat = match half {
+                Some(half) => half.get(expert).copied().unwrap_or(0),
                 None => self.groups[at].seat_of[expert].unwrap_or(0),
             };
             table.extend_from_slice(&seat.to_le_bytes());
@@ -247,7 +316,7 @@ impl Tier {
             groups: Vec::with_capacity(plan.groups.len()),
             pool: Pool::new(plan.slots),
             ring: (plan.ring > 0).then(|| Ring {
-                base: plan.slots,
+                seats: Vec::new(),
                 experts: plan.groups.first().map_or(0, |group| group.experts),
                 holds: [None, None],
                 filling: None,
@@ -291,7 +360,9 @@ impl Tier {
             prefetch_k: crate::diag::on().prefetch_k.unwrap_or(PREFETCH_K),
             threads: crate::diag::on().seat_threads.unwrap_or(SEAT_THREADS),
             blocked: false,
-            pending: Vec::new(),
+            landing: Vec::new(),
+            prefill_min: if plan.ring > 0 { plan.prefill_min } else { 0 },
+            whole: false,
         };
         for (at, group) in plan.groups.iter().enumerate() {
             let bands = group
@@ -349,6 +420,94 @@ impl Tier {
     /// seat numbers. `whole` says the fire is a prefill one (some lane has
     /// the ring's row count or more), which takes the ring when there is one.
     #[allow(clippy::too_many_arguments)]
+    /// Open a fire over these lane row counts and say whether it is a
+    /// prefill one. A prefill fire names nearly every expert of every layer,
+    /// so it borrows two whole layers of seats from the pool and runs its
+    /// routed matmuls over those, leaving the rest of the pool as the decode
+    /// left it; the damage to the working set is those `2 * experts` seats,
+    /// whatever the layer count.
+    pub fn begin_fire(&mut self, lane_rows: &[u32]) -> Result<bool> {
+        // The fire before this one is over: take its last prefetch, so the
+        // seats it is landing in are not held against this fire's borrow. A
+        // fire the shell refused after staging never ended; end it now,
+        // rather than borrow twice.
+        self.join_inflight()?;
+        self.end_fire()?;
+        let whole = self.prefill_min > 0
+            && lane_rows.iter().any(|&rows| rows >= self.prefill_min)
+            && self.ring.is_some();
+        self.whole = whole;
+        if whole {
+            self.borrow_ring()?;
+        }
+        Ok(whole)
+    }
+
+    /// Close the fire: the borrowed seats go back to the pool holding the
+    /// last two layers they were filled with, at the cold end of the LRU,
+    /// where a decode may hit them but an eviction takes them first.
+    pub fn end_fire(&mut self) -> Result<()> {
+        if !self.whole {
+            return Ok(());
+        }
+        self.whole = false;
+        self.ring_join(None)?;
+        let Some(ring) = self.ring.as_mut() else {
+            return Ok(());
+        };
+        let experts = ring.experts as usize;
+        let seats = std::mem::take(&mut ring.seats);
+        let holds = std::mem::take(&mut ring.holds);
+        if seats.len() < 2 * experts {
+            return Ok(());
+        }
+        for (half, held) in holds.iter().enumerate() {
+            for (expert, &seat) in seats[half * experts..][..experts].iter().enumerate() {
+                self.pool.hold(seat, Hold::Free);
+                match held {
+                    // the half holds this layer, expert by expert
+                    Some(group) => {
+                        self.assign(*group, seat, expert as u32);
+                        self.pool.unlink(seat);
+                        self.pool.push_front(seat);
+                    }
+                    // never filled: nothing sits in it
+                    None => self.pool.strip(seat),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Take `2 * experts` seats for this fire's ring: the ones never used
+    /// first, then the coldest, exactly as a miss would.
+    fn borrow_ring(&mut self) -> Result<()> {
+        let experts = self.ring.as_ref().map_or(0, |ring| ring.experts);
+        let mut seats = Vec::with_capacity(2 * experts as usize);
+        for _ in 0..2 * experts {
+            match self.take(0) {
+                Ok(seat) => {
+                    self.pool.hold(seat, Hold::Fire);
+                    seats.push(seat);
+                }
+                // Give back what this borrow took before refusing, or the
+                // pool loses those seats for the rest of the load.
+                Err(why) => {
+                    for seat in seats {
+                        self.pool.strip(seat);
+                    }
+                    self.whole = false;
+                    return Err(why);
+                }
+            }
+        }
+        if let Some(ring) = self.ring.as_mut() {
+            ring.seats = seats;
+            ring.holds = [None, None];
+        }
+        Ok(())
+    }
+
     pub fn segment(
         &mut self,
         arena: &mut Buffer,
@@ -357,13 +516,12 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
-        whole: bool,
     ) -> Result<()> {
         let Some(&at) = self.of_routes.get(&routes.0) else {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, whole);
+        let out = self.segment_at(at, arena, handles, routes, rect, hint, span);
         self.cut_ns += started.elapsed().as_nanos() as u64;
         out
     }
@@ -467,14 +625,15 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
-        whole: bool,
     ) -> Result<()> {
         self.join_inflight()?;
-        if whole && self.ring.is_some() {
+        // The cut that brought us here waited for the previous segment's
+        // matmuls, so nothing on the device reads those seats any more.
+        self.pool.release(Hold::Segment);
+        self.segments += 1;
+        if self.whole {
             return self.ring_at(at, arena, handles, routes, rect, span);
         }
-        // a fill a refused fire left in flight copies from seats this segment evicts
-        self.ring_join(usize::MAX)?;
         self.segment_rows(at, arena, handles, routes, rect, hint, span)
     }
 
@@ -533,16 +692,30 @@ impl Tier {
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
-        // The cut that brought us here waited for the previous segment's
-        // matmuls, so nothing on the device reads a seat any more: every pin
-        // is released and this segment pins only what it reads.
-        self.pool.pinned.fill(false);
-        self.segments += 1;
         if span.rows == 0 {
             return Ok(());
         }
         let (_, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
         self.dump_rows(at, &raw, rect.width as usize);
+        let seating = self.decide(at, &raw)?;
+        self.land(seating)?;
+        self.say_seats(at, None)?;
+        if self.prefetch
+            && let Some(rows) = self.predicted.get(at + 1).cloned().flatten()
+        {
+            self.prefetch(at + 1, &rows)?;
+        }
+        Ok(())
+    }
+
+    /// Where every expert this segment routes to will sit, and the copies
+    /// that must land before its matmuls read them. Deciding moves no bytes
+    /// and makes no expert resident: it takes seats and holds them, so a
+    /// second row naming the same expert finds the same answer and no two
+    /// experts are given one seat.
+    fn decide(&mut self, at: usize, raw: &[u8]) -> Result<Seating> {
+        let mut seating = Seating::default();
+        let mut taken: BTreeMap<u32, u32> = BTreeMap::new();
         for entry in raw.as_chunks::<4>().0 {
             let id = i32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             if id < 0 {
@@ -558,14 +731,58 @@ impl Tier {
                     self.groups[at].bands[0].name, self.groups[at].experts
                 )));
             }
-            self.seat(at, expert)?;
+            if let Some(&seat) = taken.get(&expert) {
+                self.pool.bump(seat);
+                continue;
+            }
+            if let Some(seat) = self.groups[at].seat_of[expert as usize] {
+                self.hits += 1;
+                self.pool.bump(seat);
+                self.pool.hold(seat, Hold::Segment);
+                taken.insert(expert, seat);
+                continue;
+            }
+            self.misses += 1;
+            let seat = self.take(at)?;
+            self.pool.hold(seat, Hold::Segment);
+            self.jobs(at, seat, expert, &mut seating.jobs);
+            seating.landing.push((at, seat, expert));
+            taken.insert(expert, seat);
         }
-        self.flush()?;
-        self.say_seats(at, None)?;
-        if self.prefetch
-            && let Some(rows) = self.predicted.get(at + 1).cloned().flatten()
-        {
-            self.prefetch(at + 1, &rows)?;
+        Ok(seating)
+    }
+
+    /// Move the bytes this seating asked for, then say the experts are
+    /// resident. Nothing is resident before its bytes are there: a read that
+    /// refuses leaves an empty seat, not a false hit.
+    fn land(&mut self, seating: Seating) -> Result<()> {
+        self.blocked = !seating.jobs.is_empty();
+        if seating.jobs.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        match self.source.file() {
+            Some(file) => self
+                .store
+                .write_from_file(file, &seating.jobs, self.threads)?,
+            None => {
+                for &(into, from, len) in &seating.jobs {
+                    let from = usize::try_from(from).unwrap_or(usize::MAX);
+                    let len = usize::try_from(len).unwrap_or(usize::MAX);
+                    let source = self.source.get(from, len).ok_or_else(|| Fault::Ceiling {
+                        what: "bytes of the seat source",
+                        need: (from + len) as u64,
+                        have: self.source.len(),
+                    })?;
+                    self.store.write(into, source)?;
+                }
+            }
+        }
+        self.swaps += seating.jobs.len() as u64;
+        self.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
+        self.copy_ns += started.elapsed().as_nanos() as u64;
+        for (at, seat, expert) in seating.landing {
+            self.assign(at, seat, expert);
         }
         Ok(())
     }
@@ -581,14 +798,16 @@ impl Tier {
         rect: Tensor,
         span: MaskSpan,
     ) -> Result<()> {
-        self.pool.pinned.fill(false);
-        self.segments += 1;
         let half = self.ring_ready(at)?;
-        let (base, experts) = {
+        let (seats, experts) = {
             let ring = self.ring.as_ref().expect("the caller checked");
-            (ring.base + half as u32 * ring.experts, ring.experts)
+            let experts = ring.experts as usize;
+            (
+                ring.seats[half * experts..][..experts].to_vec(),
+                ring.experts,
+            )
         };
-        self.say_seats(at, Some(base))?;
+        self.say_seats(at, Some(&seats))?;
         if span.rows > 0 {
             let (_, raw) = Self::routing_bytes(arena, handles, routes, rect, span)?;
             self.dump_rows(at, &raw, rect.width as usize);
@@ -626,7 +845,9 @@ impl Tier {
     }
 
     /// Join the fill in flight, if any, and note which half it landed in.
-    fn ring_join(&mut self, wanted: usize) -> Result<()> {
+    /// `wanted` is the group whose cut is waiting on it, when one is: only
+    /// that wait is the fire's to account for.
+    fn ring_join(&mut self, wanted: Option<usize>) -> Result<()> {
         let Some(ring) = self.ring.as_mut() else {
             return Ok(());
         };
@@ -639,7 +860,7 @@ impl Tier {
                 "the prefill ring's fill thread panicked".to_string(),
             ))
         });
-        if group == wanted {
+        if wanted == Some(group) {
             ring.wait_ns += started.elapsed().as_nanos() as u64;
         }
         landed?;
@@ -649,7 +870,7 @@ impl Tier {
 
     /// The half holding group `at`, filling it now if no fill was ahead.
     fn ring_ready(&mut self, at: usize) -> Result<usize> {
-        self.ring_join(at)?;
+        self.ring_join(Some(at))?;
         let held = self
             .ring
             .as_ref()
@@ -666,7 +887,7 @@ impl Tier {
                 .is_some_and(|ring| at > 0 && ring.holds[0] == Some(at - 1)),
         );
         self.ring_fill(at, half)?;
-        self.ring_join(at)?;
+        self.ring_join(Some(at))?;
         Ok(half)
     }
 
@@ -680,9 +901,13 @@ impl Tier {
                     .to_string(),
             ));
         };
-        let (base, experts) = {
+        let (seats, experts) = {
             let ring = self.ring.as_ref().expect("the caller checked");
-            (ring.base + half as u32 * ring.experts, ring.experts)
+            let experts = ring.experts as usize;
+            (
+                ring.seats[half * experts..][..experts].to_vec(),
+                ring.experts,
+            )
         };
         let mut copies: Vec<Job> = Vec::new();
         let mut reads: Vec<Job> = Vec::new();
@@ -690,7 +915,7 @@ impl Tier {
         {
             let held = &self.groups[group];
             for expert in 0..experts.min(held.experts) {
-                let dst = base + expert;
+                let dst = seats[expert as usize];
                 match held.seat_of[expert as usize] {
                     Some(seat) => {
                         copied += 1;
@@ -754,16 +979,19 @@ impl Tier {
         }
     }
 
-    fn spawn(&mut self, jobs: Vec<Job>) -> Result<()> {
+    /// Read this seating's bytes on a thread of its own. The seats are held
+    /// until `join_inflight` takes the read and makes them resident.
+    fn spawn(&mut self, seating: Seating) -> Result<()> {
         let Some(file) = self.file.clone() else {
             return Ok(());
         };
-        if jobs.is_empty() {
+        if seating.jobs.is_empty() {
             return Ok(());
         }
-        self.swaps += jobs.len() as u64;
-        self.bytes_read += jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
-        let writers = self.store.file_writers(&jobs)?;
+        self.swaps += seating.jobs.len() as u64;
+        self.bytes_read += seating.jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
+        let writers = self.store.file_writers(&seating.jobs)?;
+        self.landing = seating.landing;
         let threads = self.threads;
         self.inflight = Some(std::thread::spawn(move || {
             for (writer, jobs) in &writers {
@@ -778,8 +1006,8 @@ impl Tier {
         if self.file.is_none() {
             return Ok(());
         }
-        // Pins stay: the segment that just ran pinned the seats the device is
-        // about to read, and a prefetch may only evict around them.
+        // The segment that just ran holds the seats the device is about to
+        // read, so a prefetch takes seats around them.
         let mut wanted: Vec<u32> = Vec::new();
         for row in rows {
             for &expert in row.iter().take(self.prefetch_k) {
@@ -788,113 +1016,84 @@ impl Tier {
                 }
             }
         }
-        let mut jobs: Vec<Job> = Vec::new();
+        let mut seating = Seating::default();
         for expert in wanted {
             if let Some(seat) = self.groups[at].seat_of[expert as usize] {
                 self.pool.bump(seat);
                 continue;
             }
-            let Ok(seat) = self.place(at, expert) else {
+            let Ok(seat) = self.take(at) else {
                 break;
             };
-            self.jobs(at, seat, expert, &mut jobs);
+            // Held until the copy lands: the seat is not resident yet, and
+            // the cut that joins the copy is what makes it so.
+            self.pool.hold(seat, Hold::Inflight);
+            self.jobs(at, seat, expert, &mut seating.jobs);
+            seating.landing.push((at, seat, expert));
             self.prediction.prefetched += 1;
         }
-        self.spawn(jobs)
+        self.spawn(seating)
     }
 
+    /// Take the read in flight, if any, and make what it landed resident.
+    /// A read that refused leaves its seats empty and free.
     fn join_inflight(&mut self) -> Result<()> {
-        match self.inflight.take() {
-            Some(handle) => handle.join().unwrap_or_else(|_| {
-                Err(Fault::Residency(
-                    "the route prefetch thread panicked".to_string(),
-                ))
-            }),
-            None => Ok(()),
+        let Some(handle) = self.inflight.take() else {
+            return Ok(());
+        };
+        let landed = handle.join().unwrap_or_else(|_| {
+            Err(Fault::Residency(
+                "the route prefetch thread panicked".to_string(),
+            ))
+        });
+        for (at, seat, expert) in std::mem::take(&mut self.landing) {
+            self.pool.hold(seat, Hold::Free);
+            if landed.is_ok() {
+                self.assign(at, seat, expert);
+            } else {
+                self.pool.strip(seat);
+            }
         }
+        landed
     }
 
-    fn touch(&mut self, seat: u32) {
-        self.pool.bump(seat);
-        self.pool.pinned[seat as usize] = true;
-    }
-
-    /// Give `expert` of group `at` a seat, evicting whoever held it. The
-    /// caller issues the copy.
-    fn place(&mut self, at: usize, expert: u32) -> Result<u32> {
-        let seat = self.evict(at)?;
-        if let Some((group, held)) = self.pool.in_seat[seat as usize].take() {
+    /// A seat for a new expert: the LRU's victim, emptied of whoever sat
+    /// there. The caller holds it and says what lands in it.
+    fn take(&mut self, at: usize) -> Result<u32> {
+        let seat = self.pool.victim().ok_or_else(|| {
+            Fault::Residency(format!(
+                "one segment of this fire routes to more than {} distinct experts of \
+                 `{}`, and the shared pool seats {}: every seat is held by a matmul \
+                 this same segment will run, by a copy landing in it, or by this \
+                 fire's prefill ring. Every expert one segment reads must be resident \
+                 at once — raise `{CACHE_ENV}` or `device_weight_budget`, or fire \
+                 fewer tokens per step.",
+                self.pool.slots, self.groups[at].bands[0].name, self.pool.slots
+            ))
+        })?;
+        if let Some((group, held)) = self.pool.in_seat[seat as usize].take()
+            && self.groups[group as usize].seat_of[held as usize] == Some(seat)
+        {
             self.groups[group as usize].seat_of[held as usize] = None;
         }
+        self.pool.bump(seat);
+        Ok(seat)
+    }
+
+    /// Say that `expert` of group `at` is resident in `seat`, its bytes
+    /// already there. An expert sits in one seat: the one it held before,
+    /// if any, goes back to the pool empty.
+    fn assign(&mut self, at: usize, seat: u32, expert: u32) {
+        if let Some(old) = self.groups[at].seat_of[expert as usize].replace(seat)
+            && old != seat
+        {
+            self.pool.strip(old);
+        }
         self.pool.in_seat[seat as usize] = Some((at as u32, expert));
-        self.groups[at].seat_of[expert as usize] = Some(seat);
         if !self.groups[at].ever[expert as usize] {
             self.groups[at].ever[expert as usize] = true;
             self.distinct += 1;
         }
-        self.touch(seat);
-        Ok(seat)
-    }
-
-    fn seat(&mut self, at: usize, expert: u32) -> Result<u32> {
-        if let Some(seat) = self.groups[at].seat_of[expert as usize] {
-            if !self.pool.pinned[seat as usize] {
-                self.hits += 1;
-            }
-            self.touch(seat);
-            return Ok(seat);
-        }
-        self.misses += 1;
-        let seat = self.place(at, expert)?;
-        self.pending.push((at, seat, expert));
-        Ok(seat)
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        self.blocked = !self.pending.is_empty();
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let started = std::time::Instant::now();
-        let pending = std::mem::take(&mut self.pending);
-        let mut jobs: Vec<Job> = Vec::with_capacity(pending.len() * 3);
-        for &(at, seat, expert) in &pending {
-            self.jobs(at, seat, expert, &mut jobs);
-        }
-        match self.source.file() {
-            Some(file) => self.store.write_from_file(file, &jobs, self.threads)?,
-            None => {
-                for &(into, from, len) in &jobs {
-                    let from = usize::try_from(from).unwrap_or(usize::MAX);
-                    let len = usize::try_from(len).unwrap_or(usize::MAX);
-                    let source = self.source.get(from, len).ok_or_else(|| Fault::Ceiling {
-                        what: "bytes of the seat source",
-                        need: (from + len) as u64,
-                        have: self.source.len(),
-                    })?;
-                    self.store.write(into, source)?;
-                }
-            }
-        }
-        self.swaps += jobs.len() as u64;
-        self.bytes_read += jobs.iter().map(|&(_, _, len)| len).sum::<u64>();
-        self.copy_ns += started.elapsed().as_nanos() as u64;
-        Ok(())
-    }
-
-    /// A seat to reuse: never used, else the least recently used one no one
-    /// has pinned this segment.
-    fn evict(&mut self, at: usize) -> Result<u32> {
-        self.pool.victim().ok_or_else(|| {
-            Fault::Residency(format!(
-                "one segment of this fire routes to more than {} distinct experts of \
-                 `{}`, and the shared pool seats {}: every seat is pinned by a matmul \
-                 this same segment will run, so no seat can be reused. Every expert one \
-                 segment reads must be resident at once — raise `{CACHE_ENV}` or \
-                 `device_weight_budget`, or fire fewer tokens per step.",
-                self.pool.slots, self.groups[at].bands[0].name, self.pool.slots
-            ))
-        })
     }
 
     #[must_use]
@@ -1052,14 +1251,14 @@ mod tests {
         assert_eq!(pool.victim(), Some(0));
         pool.bump(0);
         assert_eq!(pool.victim(), Some(1));
-        // A pinned head is skipped.
-        pool.pinned[1] = true;
+        // A held head is skipped.
+        pool.hold(1, Hold::Segment);
         assert_eq!(pool.victim(), Some(2));
-        pool.pinned[2] = true;
-        pool.pinned[0] = true;
+        pool.hold(2, Hold::Segment);
+        pool.hold(0, Hold::Segment);
         assert_eq!(pool.victim(), None);
         // Unlinking the tail and the middle keeps the list whole.
-        pool.pinned.fill(false);
+        pool.release(Hold::Segment);
         pool.unlink(0);
         pool.unlink(2);
         assert_eq!(pool.head, 1);
