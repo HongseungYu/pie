@@ -54,7 +54,7 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 11 | A step whose reads cost > 1.5x the drive's curve is a drive stall and set aside, counted and shown; runs spoiled whole are rerun and the originals kept. | The drive pauses for seconds every ten minutes or so; no fixed a, b can carry it (issue 07). |
 | 12 | Reads within seconds of a 55 GiB prefill burst (the 128-token `all_in_mem` window) are a fifth regime, reported apart. | 0.60 ms a miss against 0.53; the drive's, not the engine's. |
 | 13 | The n-gram rows are read by uncached pread at offsets known from the load, prefetched as the fire opens from host-computed ids; no separate file (issue 08). | Their cost was the page cache's; now 0.02 ms a step, constant. The floor is 37.05. |
-| 14 | Above 8192 seats the read call's a, b ramp up between 34.2 and 36.9 GB pinned (a x 1.64, b x 1.04 at the top), continuous with the model below; the floor does not move (issue 09). | The pinned memory takes the host's last reclaimable pages; an uncached read then pays the reclaim path per call. |
+| 14 | Above 8192 seats the read call's a, b ramp up between 34.2 and 36.9 GB pinned (a x 1.64, b x 1.04 at the top), continuous with the model below; the floor does not move (issue 09). | The engine issues one threaded read pass per store chunk; past that size the pool's band regions stop sharing a Metal chunk and an expert's two preads serialise (issue 09). Not a host effect: measured flat against alignment, pressure, destination size and virgin pages. |
 
 ## Plan
 

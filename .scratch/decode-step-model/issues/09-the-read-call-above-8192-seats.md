@@ -43,16 +43,58 @@ miss above the edge against 0.35-0.39 / 0.34-0.36 below — the call's fixed par
 ~0.22 ms, the per-miss part by ~6%. The floor does not move (37.25-38.07 across the sweep), nor
 device time (33.2-33.9), nor the prefetched n-gram join (0.01-0.14).
 
-**It is not swap I/O.** No run swapped out at all (`swapouts/s` 0 throughout); the compressor
-worked at boot (7k-50k compressions/s while the pool wired 21-36 GB) and free memory sat at
-0.0-0.1 GB during every run from 8192 up — the OS keeps the file cache at the edge whatever the
-pool. What differs from 11264 on is that the pinned memory has eaten the last ~2 GB of
-reclaimable pages: an uncached pread must then find its kernel-side pages on the reclaim path
-at each call, a fixed latency per call — the same ~0.2-0.3 ms the earlier 11204-seat runs paid
-(issue 04's 0.99 ms one-miss call). So the answer to the user's question: contention, yes, but
-for pages, not for the disk.
+**It is not swap I/O, and it is not the host at all.** No run swapped out (`swapouts/s` 0
+throughout). The first explanation written here — that a pinned host makes an uncached pread
+find its kernel pages on the reclaim path — was tested afterwards and is **wrong**. The probes
+are `tools/ssd_align.c` (alignment, a wired balloon, destination size) and `tools/ssd_metal.m`
+(the destination as Metal `StorageModeShared` buffers, virgin or touched), reading the same
+artifact with the engine's own call shape (one expert = a 1.8 MiB + a 0.9 MiB pread over 16
+spawned threads):
 
-## The model (`out/validate-sm5.txt`, config `mac_m4pro_qwen38flash_np1_v4.json`)
+| condition | free memory | ms a call |
+|---|---|---|
+| host idle, 64 MiB destination | 33 GB | 0.71 |
+| 30 GB wired anonymous balloon | 3.3 GB | 0.44-0.47 (no penalty) |
+| 34 GB anonymous destination | 0.06 GB | 0.67 |
+| 40 GB of Metal shared buffers | 0.08 GB | 0.67 |
+| 40 GB of Metal buffers, reads into **virgin** pages | 0.07 GB | 0.68 |
+| beside a real idle pie server holding 13200 seats | 0.07 GB | 0.54 |
+| beside a real idle pie server holding 8192 seats | 5.4 GB | 0.55 |
+
+Alignment is not it either: `F_NOCACHE` preads at page-aligned, 4 KiB-aligned and 256-byte
+aligned offsets and destinations all cost the same (0.46-0.52 ms for 1.8 MiB), at full memory
+and under pressure alike. (For the record, on macOS `F_NOCACHE` only means the pages are not
+*kept* in the unified buffer cache; whether a read is DMA'd straight into the caller's pages or
+bounced through kernel pages is decided per call by alignment — but on this drive neither path
+is measurably dearer, so the distinction does not matter here.)
+
+**It is the engine serialising its own reads.** `Store::write_from_file` loops over the chunks
+a job set touches and issues one threaded pass per chunk:
+
+    for (at, local) in self.group(jobs)? {
+        self.chunks[at].buffer.write_from_file(file, &local, threads)?;   // one pass a chunk
+    }
+
+The store is cut into chunks at Metal's `maxBufferLength` (28.08 GiB on this box) by a greedy
+pack over the plan's spans, and the pool's two band regions (`gate_up`, N x 1.758 MiB, and
+`down`, N x 0.879 MiB) are two of those spans. Past a certain seat count they no longer share a
+chunk, so an expert's two preads — which used to run side by side on the 16 threads — run one
+after the other. The probe reproduces both halves of the measurement exactly:
+
+| the same bytes, same threads | 12 GB allocated | 40 GB allocated |
+|---|---|---|
+| both bands in ONE threaded call | 0.630 | 0.676 |
+| bands SPLIT over two calls | 0.935 | 0.990 |
+
+against the engine's 0.69-0.72 at <= 10240 seats and 0.96-1.02 at >= 11264. The ramp between
+them is the share of misses whose bands straddle the boundary. Memory has nothing to do with
+it (12 GB and 40 GB give the same pair), which is why every host-level probe came back flat.
+
+Reverse-order control: 13200 measured first reads 0.988 and 8192 straight after reads 0.694,
+so it is the pool size and not the session's drift (`sm6-rev-*`).
+
+## The model
+(`out/validate-sm5.txt`, config `mac_m4pro_qwen38flash_np1_v4.json`)
 
 A ramp, so the function is continuous with the <= 8192 model at its foot and flat past its top —
 the step the data show, spread over the 2.7 GB between the last untouched size and the first
@@ -108,6 +150,8 @@ the planted ten-miss calls; the cut-curve ramp above is the one whose knee the d
 whose natural-window errors are smallest, so it is the pick.
 
 Beyond ~42 GB pinned there is no data (13200 seats is the box's ceiling with the big config);
-the ramp is flat there by construction. On another box, or with more resident memory beside the
-engine, the knee moves with the free memory left: it is at "the last ~2 GB of reclaimable
-pages", not at a seat count.
+the ramp is flat there by construction. The ramp describes **this engine as it is today**: its
+knee is where the pool's band regions stop sharing a Metal chunk, not a property of the host.
+Fixing the serialisation (one threaded pass across chunks instead of one per chunk) should
+remove it and leave a, b flat to 13200 seats — worth ~0.3 ms per missing layer, about 1.2 ms a
+step at 13200 and 2 ms at 11264.

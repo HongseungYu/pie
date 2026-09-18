@@ -20,10 +20,13 @@ thermal state and memory before, during and after).
 
 ## Update 2026-09-18: above 8192 seats, up to 13200 (~42 GB pinned) — issue 09
 
-The read call steps up once the pinned memory has taken the host's last ~2 GB of reclaimable
-pages: a one-miss call 0.70 ms through 10240 seats, 0.96-1.02 from 11264 on (not swap I/O —
-no run swapped out; the uncached read's pages come off the reclaim path). Floor, device time
-and the n-gram join do not move. Modelled as a ramp, continuous with the model below:
+The read call steps up above 10240 seats: a one-miss call 0.70 ms through 10240, 0.96-1.02 from
+11264 on. **The cause is the engine, not the host** — `Store::write_from_file` issues one
+threaded pass per store chunk, and past that size the pool's two band regions no longer share a
+Metal chunk, so an expert's two preads serialise (probe: 0.63 both-in-one vs 0.94 split, at any
+memory). Alignment, memory pressure, a 40 GB Metal destination and virgin pages were all tested
+and are flat (issue 09). Floor, device time and the n-gram join do not move. Modelled as a ramp,
+continuous with the model below — and removable by fixing the serialisation:
 
     P  = pinned GB = N x 2.637 MiB + 6.5 GB (planes, arena, KV, tables; ~1.5 GB of other resident memory beside)
     r  = clamp((P - 34.2) / 2.7, 0, 1)          (N = 10240 -> 0, N = 11264 -> 1 on this box)
