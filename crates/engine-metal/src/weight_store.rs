@@ -5,7 +5,7 @@ use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 type Job = (u64, u64, u64);
 type Grouped = Vec<(usize, Vec<Job>)>;
-type Writes = Vec<(FileWriter, Vec<Job>)>;
+type Writes = crate::device::alloc::Writes;
 
 #[derive(Clone, Debug)]
 struct Chunk {
@@ -119,12 +119,29 @@ impl Store {
         jobs: &[(u64, u64, u64)],
         threads: usize,
     ) -> Result<()> {
-        for (at, local) in self.group(jobs)? {
-            self.chunks[at]
-                .buffer
-                .write_from_file(file, &local, threads)?;
+        // One threaded pass over every chunk's jobs; `PIE_STORE_SERIAL_CHUNKS=1`
+        // keeps the pass-a-chunk order for measuring what it cost.
+        if serial_chunks() {
+            for (at, local) in self.group(jobs)? {
+                self.chunks[at]
+                    .buffer
+                    .write_from_file(file, &local, threads)?;
+            }
+            return Ok(());
         }
-        Ok(())
+        let writers = self.file_writers(jobs)?;
+        FileWriter::pread_many(file, &writers, threads)
+    }
+
+    /// Which chunk holds `offset`, and the chunk's `[start, end)`.
+    #[must_use]
+    pub fn chunk_of(&self, offset: u64) -> (usize, u64, u64) {
+        let at = self
+            .chunks
+            .partition_point(|chunk| chunk.start <= offset)
+            .saturating_sub(1);
+        let chunk = &self.chunks[at];
+        (at, chunk.start, chunk.start + chunk.buffer.bytes())
     }
 
     pub fn file_writers(&mut self, jobs: &[Job]) -> Result<Writes> {
@@ -171,4 +188,14 @@ impl Store {
     pub fn chunks(&self) -> usize {
         self.chunks.len()
     }
+}
+
+fn serial_chunks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("PIE_STORE_SERIAL_CHUNKS").as_deref().map(str::trim),
+            Ok("1" | "on" | "true" | "yes")
+        )
+    })
 }

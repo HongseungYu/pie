@@ -537,10 +537,7 @@ impl Slab {
         self.reads += jobs.len() as u64 / self.bands.len().max(1) as u64;
         let writers = self.store.file_writers(&jobs)?;
         self.inflight = Some(std::thread::spawn(move || {
-            for (writer, jobs) in &writers {
-                writer.pread(&file, jobs, ROW_THREADS)?;
-            }
-            Ok(())
+            crate::device::alloc::FileWriter::pread_many(&file, &writers, ROW_THREADS)
         }));
         Ok(())
     }

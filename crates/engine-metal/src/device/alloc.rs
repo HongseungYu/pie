@@ -144,6 +144,9 @@ impl Buffer {
     }
 }
 
+/// One store chunk's writer and the jobs that land in it.
+pub type Writes = Vec<(FileWriter, Vec<(u64, u64, u64)>)>;
+
 pub struct FileWriter {
     #[cfg(target_vendor = "apple")]
     base: usize,
@@ -192,6 +195,70 @@ impl FileWriter {
         #[cfg(not(target_vendor = "apple"))]
         {
             let _ = threads;
+            Err(Fault::Deviceless)
+        }
+    }
+
+    /// Every writer's jobs in ONE threaded pass. The store is cut into
+    /// chunks at the device's largest buffer, and a pass a chunk turned an
+    /// expert whose two bands sit in different chunks into two reads run
+    /// one after the other: 0.94 ms a miss against 0.63 side by side
+    /// (.scratch/decode-step-model, issue 09).
+    pub fn pread_many(
+        file: &std::fs::File,
+        writes: &Writes,
+        threads: usize,
+    ) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            use std::os::fd::AsRawFd;
+            let flat: Vec<(usize, u64, u64)> = writes
+                .iter()
+                .flat_map(|(writer, jobs)| {
+                    jobs.iter().map(move |&(into, from, len)| {
+                        (
+                            writer.base + usize::try_from(into).expect("an offset inside a live mapping"),
+                            from,
+                            len,
+                        )
+                    })
+                })
+                .collect();
+            if flat.is_empty() {
+                return Ok(());
+            }
+            let fd = file.as_raw_fd();
+            let threads = threads.clamp(1, flat.len());
+            let per = flat.len().div_ceil(threads);
+            let failed: std::sync::Mutex<Option<Fault>> = std::sync::Mutex::new(None);
+            std::thread::scope(|scope| {
+                for chunk in flat.chunks(per) {
+                    let failed = &failed;
+                    scope.spawn(move || {
+                        for &(dst, from, len) in chunk {
+                            // SAFETY: each destination was proved inside its
+                            // writer's live mapping by `file_writer`.
+                            if let Err(why) = unsafe { pread_all(fd, dst as *mut u8, from, len) } {
+                                *failed
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            match failed
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            let _ = (file, writes, threads);
             Err(Fault::Deviceless)
         }
     }

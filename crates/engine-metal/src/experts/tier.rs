@@ -231,6 +231,22 @@ impl Tier {
             );
         }
         tier.source.settle();
+        // Where the pool's regions sit among the store's chunks: a region
+        // split from its partner is what serialised the reads (issue 09).
+        if let Some(group) = tier.groups.first() {
+            let slots = u64::from(tier.pool.slots);
+            let mut said = Vec::new();
+            for band in &group.bands {
+                let (c0, ..) = tier.store.chunk_of(band.at);
+                let (c1, ..) = tier.store.chunk_of(band.at + slots * band.stride - 1);
+                said.push(format!("{} seats {}..{} in chunk {}..{}", band.name, band.at >> 30, (band.at + slots * band.stride) >> 30, c0, c1));
+            }
+            eprintln!(
+                "engine-metal: weight store in {} chunk(s); {}",
+                tier.store.chunks(),
+                said.join("; ")
+            );
+        }
         Ok(tier)
     }
 
@@ -844,10 +860,7 @@ impl Tier {
             for (copier, jobs) in &copiers {
                 copier.copy(jobs, threads)?;
             }
-            for (writer, jobs) in &writers {
-                writer.pread(&file, jobs, threads)?;
-            }
-            Ok(())
+            crate::device::alloc::FileWriter::pread_many(&file, &writers, threads)
         });
         if let Some(ring) = self.ring.as_mut() {
             ring.filling = Some((group, half, handle));
@@ -881,10 +894,7 @@ impl Tier {
         self.landing = seating.landing;
         let threads = self.threads;
         self.inflight = Some(std::thread::spawn(move || {
-            for (writer, jobs) in &writers {
-                writer.pread(&file, jobs, threads)?;
-            }
-            Ok(())
+            crate::device::alloc::FileWriter::pread_many(&file, &writers, threads)
         }));
         Ok(())
     }
