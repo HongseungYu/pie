@@ -291,9 +291,30 @@ Optional — `C` split by layer type and module (needs its own run; never mix wi
 
 ```bash
 cd $H && EXTRA_ARGS="--diag kernel-profile=2" ./sm_run.sh sm-kern-s8192 all_in_mem 8192 48 0 1 $HEAT
-.venv/bin/python kernelsplit.py sm-kern-s8192 --frame-ms <measured zero-miss device ms> --last 32
+.venv/bin/python kernelsplit.py sm-kern-s8192 --rows 1 --frame-ms <measured zero-miss device ms> --last 32
 # gate: "sum check X ms against the frames' X" and "unclassified 0.000 ms"
 ```
+
+`--frame-ms` is the **measured** `C` from §3, never the profiled sum: the per-kernel command buffers
+put that sum 11% over the real frame at batch 1 (and 1% under it at batch 4), so the split is a share
+of a measured total, not a total of its own. `--rows` is the batch: a decode fire at batch N has N
+rows and `blocks()` keeps only fires of exactly that width.
+
+**At batch > 1, measure it per batch — do not reuse batch 1's.** `sm_kern_batch.sh N` runs it (N
+copies of one prompt, the c3 recipe) and `layer_table.py` puts the batches side by side and writes
+one config:
+
+```bash
+cd $H && for N in 2 4 8; do ./sm_kern_batch.sh $N; done
+.venv/bin/python layer_table.py --batch 1:sm-kern-s8192:<C1> --batch 2:kern-b2-s8192:<C2> ... \
+  --base out/sim/configs/<the batch config>.json --name <box>_<model>_batch_v<n>
+```
+
+A shape carries the batch as a trailing dimension (`[2560,16384,N]`) or a leading one
+(`[N,4,10240]`); `norm_shape()` rewrites it into the batch-1 form so `classify()` keeps one set of
+rules. Add a rule only if `unclassified` is non-zero. On this box the split moved a long way with
+the batch — `hyper_connection` 0.125 → 0.132 → 0.485 → 0.534 ms a layer, on a kernel boundary at
+batch 4, not a slope (why: issue 12). Expect to have to measure every batch you will simulate.
 
 ---
 
@@ -328,7 +349,8 @@ cd $H && EXTRA_ARGS="--diag kernel-profile=2" ./sm_run.sh sm-kern-s8192 all_in_m
 | `$H/stepmodel.py:33` | `MIB = 2.637` (**B**) → read off the load line: `13200 seats x 2.64 MiB`, or `bytes_read / misses` |
 | `$H/validate.py:230-233` | the minimax grid is **model-dependent**: `b` is ms a **MiB** (`validate.py:119` divides by `sm.MIB`). Halve the expert and the per-MiB figure roughly doubles — a ~1 MiB expert sits near 0.36 ms/MiB and the search clamps at 0.180 with no message. Rescale by `2.637 / B_new` before the first fit |
 | `$H/kernelsplit.py:19` | `GDN, FULL, ALL = 36, 12, 48` — used both as launch-count fingerprints **and** as divisors; wrong values mis-assign kernels *and* mis-scale per-layer ms |
-| `$H/kernelsplit.py:22-40` | `classify()` entrypoint prefixes and shape strings — a stale rule shows up as non-zero `unclassified` |
+| `$H/kernelsplit.py:22-42` | `norm_shape()` — which dimension of a shape is the batch; a wrong guess silently mis-normalises |
+| `$H/kernelsplit.py:44-63` | `classify()` entrypoint prefixes and shape strings — a stale rule shows up as non-zero `unclassified` |
 | `$H/tools/ssd_gap.c:20-21`, `ssd_align.c:25-27`, `ssd_metal.m:21-22` | `GU 1843200`, `DN 921600` = one expert's band bytes (**three copies**, change together); `ROW 96` = one n-gram row |
 | `$H/validate.py:63` | `--ple-max 0.5` — set high for a model with no PLE table |
 | `$H/profile_run.py:38-39` | `INFERLET`, `CONFIG` toml; `$H/*.toml:8` `port` must match `profile_run.py:41 PORT` |
@@ -362,6 +384,7 @@ cd $H && EXTRA_ARGS="--diag kernel-profile=2" ./sm_run.sh sm-kern-s8192 all_in_m
 | **which MoE kernel the decode takes** | the routed matmul batches only when `pairs = rows × top_k ≥ experts × moe_batch_min_per_expert` (default 2) — `$P/crates/kernels-metal/src/linear/moe.rs:35-43` (`should_batch`), `$P/crates/kernels-metal/src/tuning.rs:55,81`. For this model that is 1024 pairs = **103 sequences**; at batch 4–16 the decode stays on the per-row point. State which side you are on in the record and never fit across the boundary (why: pool-deepening issue 14) |
 | forcing the batched point | `[engine.tuning] moe_batch_min_pairs = <pairs>` states a lower bound instead (default 0 = off, `kernels-metal/src/tuning.rs:57,82`; `pie-qwen38-batch.toml` uses 40, `-batch-perrow.toml` uses 100000 to pin the per-row point for an A/B). Measured at 80–360 pairs only; the scheduler at 1024 pairs is untested |
 | re-measure the floor | **`C` is a step function in batch, not a slope**: batch 4 costs 2.2× batch 1's device time (38 → 84 ms) because the dense projections switch kernel (`affine_qmv_fast` → `affine_qmv_rows_r_4` + `dense_gemm_t_bm_8`) while the routed matmul stays per-row and simply gets 3× dearer (why: pool-deepening issue 15). Never reuse a batch-1 floor |
+| re-measure the **split** too | the same switch moves the split much further than it moves `C`: `hyper_connection` 0.125 → 0.132 → 0.485 → 0.534 ms a layer at batch 1/2/4/8, because four nodes leave `dense_gemv_t_ksplit` for `dense_gemm_t_bm_8` at batch ≥ 4 and 59% of the batch 2 → 4 step in `C` is that one switch (why: issue 12). Never reuse a batch-1 `layer_types`, and never interpolate one between measured batches |
 | re-measure `a` and `b` | a call at batch N reads more experts at once; the per-call fixed part is amortised differently, so the (a, b) split moves even if total bytes/ms does not |
 | `$H/stepmodel.py:57,71` | `batch=1` is a Python default with **no CLI flag** — add `--batch` and thread it through `requests()` / `steps()`, or a decode fire of N rows is read as a prefill (`stepmodel.py:61`) and every step vanishes. Verify with `stepmodel.py window <tag>`: it must report the expected number of decode steps, not "no decode fires" |
 | `$H/validate.py:39,113,159` | the three `.steps(...)` call sites drop `batch` — all three must pass it, or the fit stays at batch 1 whatever `stepmodel.py` says |
@@ -448,7 +471,8 @@ engine only on a probe that reproduces **both** regimes quantitatively.
 | `sm_sweep5.sh` + `sweep5_table.py` | pools above the quick pick: planted call, floor, natural window, host state, in one row a pool | `./sm_sweep5.sh all` (forces `pie-qwen38-big.toml`) |
 | `sm_ple_ab.sh` | mapping vs pread vs pread+prefetch for the n-gram rows | `./sm_ple_ab.sh` |
 | `sweep7_table.py` | store-chunk layout + 1-miss call, old order vs new | `.venv/bin/python sweep7_table.py` |
-| `kernelsplit.py` | C by layer type and module | `.venv/bin/python kernelsplit.py <tag> --frame-ms <ms> --last 32` |
+| `kernelsplit.py` | C by layer type and module, one batch | `.venv/bin/python kernelsplit.py <tag> --rows <batch> --frame-ms <C> --last 32` |
+| `sm_kern_batch.sh` + `layer_table.py` | the same split at every batch, side by side, into one sim config | `./sm_kern_batch.sh <N>`; `layer_table.py --batch N:<tag>:<C> ... --name <config>` |
 | `tools/ssd_gap.c` | is the rare-read penalty the drive, the threads, or the CPU? | `cc -O2 -o tools/ssd_gap tools/ssd_gap.c -lpthread`; `./tools/ssd_gap "$ZT" cpu` |
 | `tools/ssd_align.c` | alignment / host pressure / destination size | `cc -O2 -o tools/ssd_align tools/ssd_align.c -lpthread`; `./tools/ssd_align "$ZT" <balloon_gb> <dest_gb> 16 1` |
 | `tools/ssd_metal.m` | same, destination a Metal `StorageModeShared` buffer, optional virgin pages | `clang -O2 -o tools/ssd_metal tools/ssd_metal.m -framework Metal -framework Foundation`; `./tools/ssd_metal "$ZT" 40 16 1 8` |

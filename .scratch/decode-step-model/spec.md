@@ -55,6 +55,7 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 12 | Reads within seconds of a 55 GiB prefill burst (the 128-token `all_in_mem` window) are a fifth regime, reported apart. | 0.60 ms a miss against 0.53; the drive's, not the engine's. |
 | 13 | The n-gram rows are read by uncached pread at offsets known from the load, prefetched as the fire opens from host-computed ids; no separate file (issue 08). | Their cost was the page cache's; now 0.02 ms a step, constant. The floor is 37.05. |
 | 14 | Above 8192 seats the read call's a, b ramped up between 34.2 and 36.9 GB pinned (a x 1.64, b x 1.04 at the top) — the engine serialising an expert's preads across store chunks (issue 09); fixed in issue 10, after which a, b are flat to 13200 seats. | The engine issues one threaded read pass per store chunk; past that size the pool's band regions stop sharing a Metal chunk and an expert's two preads serialise (issue 09). Not a host effect: measured flat against alignment, pressure, destination size and virgin pages. |
+| 15 | `C`'s split by layer type and module is measured once per batch, each scaled to that batch's own measured `C`, and never interpolated between batches. | Four nodes change kernel at batch >= 4, so the split crosses a boundary rather than following a slope; `hyper_connection` goes 0.132 -> 0.485 ms a layer between batch 2 and 4, and 59% of the batch 2 -> 4 step in `C` is that switch (issue 12). |
 
 ## How to repeat this
 
@@ -76,3 +77,4 @@ when the manual sends you.
 - 09 the read call above 8192 seats: a ramp, traced to the engine serialising reads per store chunk (`..._v4.json`, before the fix).
 - 10 one threaded pass over the chunks: the ramp removed; the flat model holds to 13200 seats (`..._v5.json`).
 - 11 batch 2, 4 and 8: the batch moves the floor only; a and b are unchanged (`..._batch_v1.json`).
+- 12 C by layer and module at batch 2, 4 and 8: the split moves far more than `C` does — 59% of the batch 2 -> 4 step is one `dense_gemv_t_ksplit` -> `dense_gemm_t_bm_8` switch (`..._batch_v2.json`).

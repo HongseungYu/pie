@@ -20,6 +20,34 @@ thermal state and memory before, during and after).
 | host asleep between reads | a call 0.35 ms when dense, 0.83 when rare (issue 03) | one thread spinning | `PIE_METAL_CPU_HEATER=1` |
 | n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | read them by uncached pread at known offsets, prefetched as the fire opens (issue 08) | `PIE_PLE_SOURCE=pread PIE_PLE_PREFETCH=1` (defaults) |
 
+## Update 2026-09-18 (later): C by layer and module at every batch — issue 12
+
+The batch-1 split below was the only one measured, so `batch_v1.json` carried batch 1's
+`layer_types` beside a per-batch floor. Now measured at 2, 4 and 8
+(`kernelsplit.py --rows N`, `sm_kern_batch.sh`, `layer_table.py`; each scaled to that
+batch's own `C`, `unclassified 0.000 ms` at every batch):
+
+| batch | 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| linear_attention per layer (x36) | 0.599 | 0.750 | 1.432 | 2.125 |
+| full_attention per layer (x12) | 0.730 | 0.883 | 1.623 | 2.453 |
+| .. attention | 0.278 / 0.409 | 0.322 / 0.455 | 0.431 / 0.622 | 0.716 / 1.044 |
+| .. hyper_connection | 0.125 | 0.132 | 0.485 | 0.534 |
+| .. ffn | 0.196 | 0.297 | 0.517 | 0.874 |
+| output (readout) | 2.530 | 2.636 | 2.845 | 5.267 |
+| C (measured) | 32.86 | 40.24 | 73.89 | 111.19 |
+
+**59% of the batch 2 -> 4 step in `C` is one kernel switch.** Four nodes leave
+`dense_gemv_t_ksplit` for `dense_gemm_t_bfloat16_bm_8_bk_64_bn_32` at batch >= 4 and cost
+1.73 -> 21.49 ms together; the hyper-connection inject matmul alone goes 0.62 -> 15.62 ms
+and stays 15.22 at batch 8, which is an overhead's signature, not work's. The routed MoE
+(5.79 / 10.54 / 17.61 / 33.87) is the part that genuinely scales; the dense projections are
+nearly free to batch up to 4. Detail and the per-node table: issue 12. Config:
+`out/sim/configs/mac_m4pro_qwen38flash_batch_v2.json` (`layer_types_by_batch`).
+
+Do not interpolate the layer numbers between measured batches: `hyper_connection` crosses a
+kernel boundary, not a slope.
+
 ## Update 2026-09-18: batch 2, 4 and 8 — issue 11
 
 The batch moves the floor only. `a` = 0.368 and `b` = 0.1360 hold at every batch measured
@@ -169,7 +197,7 @@ know the drive is slower for a while afterwards.
 Over-predicted by up to 5%, as expected from issue 07: a planted read fetches an expert the prime
 pass read seconds before, and the drive's cache serves it below a cold miss's price.
 
-## C by layer type and module
+## C by layer type and module (batch 1; every batch in the issue-12 section above)
 
 `sm-kern-s8192`, `--diag kernel-profile=2` (every kernel in its own command buffer), the
 last 32 decode fires, classified by entrypoint and shape (`kernelsplit.py`), scaled to the
