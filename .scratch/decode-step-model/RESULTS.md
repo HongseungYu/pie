@@ -20,6 +20,23 @@ thermal state and memory before, during and after).
 | host asleep between reads | a call 0.35 ms when dense, 0.83 when rare (issue 03) | one thread spinning | `PIE_METAL_CPU_HEATER=1` |
 | n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | read them by uncached pread at known offsets, prefetched as the fire opens (issue 08) | `PIE_PLE_SOURCE=pread PIE_PLE_PREFETCH=1` (defaults) |
 
+## Update 2026-09-18: batch 2, 4 and 8 — issue 11
+
+The batch moves the floor only. `a` = 0.368 and `b` = 0.1360 hold at every batch measured
+(1-miss call 0.737 / 0.714 / 0.703 / 0.701 at batch 1 / 2 / 4 / 8):
+
+    step_ms = floor(batch) + sum over layers with m_l >= 1 of ( 0.368 + 0.1360 * m_l * 2.637 )
+
+| batch | floor | C | F | tok/s at 0 misses | a sequence |
+|---|---|---|---|---|---|
+| 1 | 37.05 | 32.86 | 4.19 | 27.0 | 27.0 |
+| 2 | 45.68 | 40.24 | 5.44 | 43.8 | 21.9 |
+| 4 | 79.50 | 73.89 | 5.61 | 50.3 | 12.6 |
+| 8 | 116.65 | 111.19 | 5.46 | 68.6 | 8.6 |
+
+30 windows validated, worst 4.15% (`out/batch_table.md`). The pool must hold one step's working
+set (`batch x layers x top_k` experts) or the model does not apply — see issue 11.
+
 ## Update 2026-09-18 (later): the ramp above 8192 seats was the engine's, and is gone — issue 10
 
 `Store::write_from_file` took one threaded pass a store chunk; once the pool's `gate_up` and

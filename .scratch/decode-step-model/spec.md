@@ -75,3 +75,4 @@ when the manual sends you.
 - 08 the n-gram rows off the SSD every time, prefetched; the floor re-measured (`..._v3.json`).
 - 09 the read call above 8192 seats: a ramp, traced to the engine serialising reads per store chunk (`..._v4.json`, before the fix).
 - 10 one threaded pass over the chunks: the ramp removed; the flat model holds to 13200 seats (`..._v5.json`).
+- 11 batch 2, 4 and 8: the batch moves the floor only; a and b are unchanged (`..._batch_v1.json`).

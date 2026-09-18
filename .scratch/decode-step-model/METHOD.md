@@ -337,7 +337,12 @@ cd $H && EXTRA_ARGS="--diag kernel-profile=2" ./sm_run.sh sm-kern-s8192 all_in_m
 
 ### 5.3 Another batch size
 
-> **Before anything else: there is no batch>1 launcher yet.** `profile_run.py` / `sm_run.sh` fire one
+> **Batch > 1 is measured; issue 11 has the results and this section is the recipe it used.**
+> `profile_run.py --seqs N [--prompts a,b,...]`, `stepmodel.py --batch N`, `validate.py --batch N`
+> and `pie-qwen38-b{2,4,8}.toml` exist now; `sm_sweep_batch.sh <N> [groups]` runs the whole
+> procedure. What follows was written before that and still names everything that needs care.
+>
+> **Superseded:** `profile_run.py` / `sm_run.sh` fire one
 > sequence and take no concurrency flag. `batched.py --seqs N` is the only thing that launches several,
 > and it is a probe, not a measurement rig: it sets `PIE_EXPERT_CACHE_LOG` (`batched.py:29`) but **not**
 > `PIE_EXPERT_CACHE_CUT_LOG`, so it writes no `cuts.csv` and therefore no `m_l`. Two minimum edits before
@@ -366,13 +371,14 @@ cd $H && EXTRA_ARGS="--diag kernel-profile=2" ./sm_run.sh sm-kern-s8192 all_in_m
 | re-pick the pool ceiling | two caps, not one: **seats** (RAM, §1.4, now ~N× the working set) and **`max_state_slots`** (what actually bounds concurrency, §0's admission line; `total_pages` / `max_model_len` only bound context length). Recompute `FIXED_GB` from the load log after changing either |
 | configs | `$H/pie-qwen38-batch.toml`, `-batch4.toml` (`max_state_slots = 8`, `total_pages = 512`), `-batch-perrow.toml` are starting points |
 
-**Does each configuration still work?**
+**Does each configuration still work?** (answered by measurement in issue 11)
 
 | config | at batch > 1 | why |
 |---|---|---|
 | c1 max misses | **unchanged** | the floor pool is still 2E: a segment names at most one layer's experts however many rows it carries, and the ring keys off per-lane rows, so N one-row lanes stay on the pool (pool-deepening issue 14) |
 | c2 min misses | unchanged in form, **new `SEATS_MAX`** | §1.4 again; the hit-rate gate (≥ ~0.85) needs a much larger pool |
 | c3 zero misses | **the one at risk** | `u` rises with N, so `W ≈ 0.6 × (N_seats − 2·ring) / u` shrinks ~N×. If `W` falls below ~16 steps the floor is not measurable this way: raise the pool, or use one document across all N sequences so the union stops growing |
+| c1 max misses (measured) | **the floor pool is outside the model at batch > 1**: 1024 seats hold less than one fire's working set, so the pool misses everything and the drive saturates (`b` +10%). Use `c1b`, a pool of `1024 x batch` (issue 11) | |
 | c4 planted misses | **unchanged, plant included** | the plant is per (fire, layer), not per row — `all:1` is still 48.0 misses in 48.00 layers at any batch (`$P/crates/engine-metal/src/experts/plan.rs:79-84`). This is the cleanest way to get `a` and `b` at batch N |
 | mid | unchanged | |
 
