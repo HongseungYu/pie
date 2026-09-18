@@ -488,6 +488,9 @@ impl Shell {
                 crate::device::spinner::start(boot.residency.cpu_heater())
             );
         }
+        if let Some(rows) = weights.rows() {
+            eprintln!("engine-metal: {}", rows.borrow().describe());
+        }
 
         {
             let kv_pool = crate::store::pool_demand(&boot.trace, paging)?;
@@ -3694,9 +3697,6 @@ impl Shell {
     fn walk_streamed(&self, p: &Prepared<'_>) -> Result<Walked> {
         let tier = self.weights.tier();
         let rows = self.weights.rows();
-        if let Some(rows) = rows {
-            rows.borrow_mut().fire();
-        }
         for (region, cut) in self.row_cuts.iter().enumerate() {
             let runs = p.windows.runs(region as u32);
             if cut.is_some() && runs > 1 {
@@ -4043,7 +4043,25 @@ impl engine::frame::Shell for Shell {
         fire_trace(|| "encode-begin".to_string());
         let walked = if self.weights.tier().is_some() || self.weights.rows().is_some() {
             let started = std::time::Instant::now();
+            // The gathered rows a fire needs are named and read now, off the
+            // host's own copy of each slot's window, while the first frames
+            // run; the hasher's cut joins them.
+            if let Some(rows) = self.weights.rows() {
+                let mut rows = rows.borrow_mut();
+                rows.fire();
+                let lanes: Vec<(u32, &[u32])> = prepared
+                    .lanes
+                    .iter()
+                    .map(|seated| (seated.lane.slot, seated.lane.tokens))
+                    .collect();
+                let pools = &self.pools;
+                rows.prefetch(&lanes, |row, slot, cells| pools.read_state(row, slot, cells))?;
+            }
             let walked = self.walk_streamed(&prepared);
+            if let (Some(rows), Some(tier)) = (self.weights.rows(), self.weights.tier()) {
+                let (read, missed) = rows.borrow().this_fire();
+                tier.borrow_mut().note_rows_read(read, missed);
+            }
             // The fire is over however it went: the ring goes back to the
             // pool and the tier counts what the fire cost it before anything
             // else is decided, and a walk that refused is the fault worth

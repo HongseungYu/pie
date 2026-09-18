@@ -97,9 +97,13 @@ pub struct FireRecord {
     /// Device time of final frames that landed since the previous record
     /// closed: the fire before this one, in steady decode.
     pub gpu_tail_ms: f64,
-    /// Host time of the n-gram row gather (the PLE table's mmap), which
-    /// pays for page-cache misses, not expert reads.
+    /// Host time of the n-gram row gather at the hasher's cut: the join of
+    /// a prefetch, and any rows read there and then.
     pub ple_ms: f64,
+    /// N-gram rows this fire read from the artifact, and how many of them
+    /// the prefetch had not already landed (read at the cut instead).
+    pub ple_reads: u64,
+    pub ple_prefetch_misses: u64,
     /// Wall clock as this fire opened, ms since the load's first fire. The
     /// step a decode takes is the gap between two of these, which is the
     /// only way to read a step off one request rather than by subtracting
@@ -140,7 +144,7 @@ pub(super) fn open_log(path: Option<&std::path::Path>) {
         let _ = writeln!(
             file,
             "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms,\
-             gpu_cut_ms,gpu_tail_ms,t_ms,ple_ms"
+             gpu_cut_ms,gpu_tail_ms,t_ms,ple_ms,ple_reads,ple_prefetch_misses"
         );
         let _ = file.flush();
         Some(std::sync::Mutex::new((0, file)))
@@ -219,7 +223,7 @@ pub fn log_fire(record: &FireRecord) {
     let (seq, file) = &mut *log;
     let _ = writeln!(
         file,
-        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
+        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
         record.rows,
         record.cuts,
         record.copies,
@@ -234,6 +238,8 @@ pub fn log_fire(record: &FireRecord) {
         record.gpu_tail_ms,
         record.t_ms,
         record.ple_ms,
+        record.ple_reads,
+        record.ple_prefetch_misses,
     );
     let _ = file.flush();
     *seq += 1;
@@ -273,6 +279,9 @@ pub(super) struct Tally {
     pub(super) tail_ns: u64,
     /// Host time of the n-gram row gathers.
     pub(super) rows_ns: u64,
+    /// This fire's n-gram row reads, and how many the prefetch missed.
+    pub(super) rows_read: u64,
+    pub(super) rows_missed: u64,
     /// When the load's first fire opened, and when this one did.
     first: Option<std::time::Instant>,
     at_ms: f64,
@@ -342,6 +351,8 @@ impl Tally {
             gpu_tail_ms: (self.tail_ns - at.tail_ns) as f64 / 1e6,
             t_ms: self.at_ms,
             ple_ms: (self.rows_ns - at.rows_ns) as f64 / 1e6,
+            ple_reads: std::mem::take(&mut self.rows_read),
+            ple_prefetch_misses: std::mem::take(&mut self.rows_missed),
         }
     }
 

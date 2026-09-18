@@ -363,6 +363,31 @@ impl Pools {
         Ok(CacheTable(rows))
     }
 
+    /// The first `cells` elements of slot `slot` in recurrent cache row
+    /// `row`, read on the host: what a kernel scanning that state would
+    /// read next. `None` when the row is not a 4-byte recurrent state.
+    #[must_use]
+    pub fn read_state(&self, row: usize, slot: u32, cells: usize) -> Option<Vec<i32>> {
+        let Some(Shape::State { stride, dtype }) = self.shapes.get(row).copied() else {
+            return None;
+        };
+        if elem_size(dtype) != 4 || u64::from(slot) >= u64::from(self.paging.slots) || cells as u64 > stride {
+            return None;
+        }
+        let mut raw = vec![0u8; cells * 4];
+        self.slabs
+            .get(row)?
+            .read(u64::from(slot) * stride * 4, &mut raw)
+            .ok()?;
+        Some(
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|e| i32::from_le_bytes(*e))
+                .collect(),
+        )
+    }
+
     pub fn clear(&mut self, slot: u32) -> Result<()> {
         if !self.has_state() {
             return Ok(());

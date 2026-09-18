@@ -257,6 +257,8 @@ impl Weights {
                     &store,
                     Source::from_host(table, gather.host_bands()),
                     &offsets,
+                    false,
+                    false,
                 )
                 .map(RefCell::new)
             })
@@ -1027,6 +1029,8 @@ fn warm(
                 &store,
                 Source::artifact(std::sync::Arc::clone(&map), rows_of),
                 &seated,
+                plan.ple_pread(),
+                plan.ple_prefetch(),
             )
             .map(RefCell::new)
         })

@@ -1071,6 +1071,12 @@ impl Tier {
         self.tally.rows_ns += ns;
     }
 
+    /// This fire's n-gram row reads, and how many the prefetch missed.
+    pub fn note_rows_read(&mut self, read: u64, missed: u64) {
+        self.tally.rows_read = read;
+        self.tally.rows_missed = missed;
+    }
+
     #[must_use]
     pub fn source(&self) -> Option<(u64, u64)> {
         self.source.backing()

@@ -46,6 +46,15 @@ pub const CUT_LOG_ENV: &str = "PIE_EXPERT_CACHE_CUT_LOG";
 
 pub const FORCE_MISS_ENV: &str = "PIE_EXPERT_CACHE_FORCE_MISS";
 
+/// `PIE_PLE_SOURCE=pread|mmap`: whether the gathered n-gram rows come off
+/// the artifact by uncached `pread` at a known offset (the default) or out
+/// of its mapping through the page cache (the old path, kept for A/B).
+pub const PLE_SOURCE_ENV: &str = "PIE_PLE_SOURCE";
+
+/// `PIE_PLE_PREFETCH=1|0`: whether a fire's n-gram rows are read as the
+/// fire opens, from ids the host computes, rather than at the hasher's cut.
+pub const PLE_PREFETCH_ENV: &str = "PIE_PLE_PREFETCH";
+
 /// Which layers `PIE_EXPERT_CACHE_FORCE_MISS` names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Layers {
@@ -162,6 +171,10 @@ pub struct Knobs {
     pub(super) cold: bool,
     /// `PIE_EXPERT_CACHE_FORCE_MISS`: misses planted in named layers.
     pub(super) force_miss: Option<ForceMiss>,
+    /// `PIE_PLE_SOURCE`: n-gram rows by uncached pread (true) or the mapping.
+    pub(super) ple_pread: bool,
+    /// `PIE_PLE_PREFETCH`: n-gram rows read as the fire opens.
+    pub(super) ple_prefetch: bool,
 }
 
 impl Default for Knobs {
@@ -203,6 +216,16 @@ impl Knobs {
                 Ok(word) if !word.trim().is_empty() => Some(ForceMiss::parse(&word)?),
                 _ => None,
             },
+            ple_pread: !matches!(
+                std::env::var(PLE_SOURCE_ENV)
+                    .map(|word| word.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Ok("mmap")
+            ),
+            ple_prefetch: !matches!(
+                std::env::var(PLE_PREFETCH_ENV).as_deref().map(str::trim),
+                Ok("0" | "off" | "false" | "no")
+            ),
         })
     }
 
@@ -221,6 +244,8 @@ impl Knobs {
             cpu_heater: false,
             cold: false,
             force_miss: None,
+            ple_pread: true,
+            ple_prefetch: true,
         }
     }
 
@@ -769,6 +794,18 @@ impl Plan {
     #[must_use]
     pub fn force_miss(&self) -> Option<&ForceMiss> {
         self.knobs.force_miss.as_ref()
+    }
+
+    /// Whether n-gram rows are read by uncached pread rather than the mapping.
+    #[must_use]
+    pub fn ple_pread(&self) -> bool {
+        self.knobs.ple_pread
+    }
+
+    /// Whether n-gram rows are read as the fire opens.
+    #[must_use]
+    pub fn ple_prefetch(&self) -> bool {
+        self.knobs.ple_prefetch
     }
 
     #[must_use]
