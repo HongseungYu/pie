@@ -1,5 +1,7 @@
 # Decode-step model: results
 
+Method and how to repeat it elsewhere: `METHOD.md`.
+
 Branch `metal-expert-cache`, 2026-09-17. Batch 1, mlx-community/Qwen3.8-Flash-Next-4bit
 (`qwen38-flash-next-u4g64-kv-bf16`), M4 Pro 48 GB, 1k prompt, the teacher-forced 1024-token
 sequence of `out/forced_tokens.json`. Reader: `scratch/qwen38-profile/stepmodel.py`;

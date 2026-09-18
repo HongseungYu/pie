@@ -56,6 +56,13 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 13 | The n-gram rows are read by uncached pread at offsets known from the load, prefetched as the fire opens from host-computed ids; no separate file (issue 08). | Their cost was the page cache's; now 0.02 ms a step, constant. The floor is 37.05. |
 | 14 | Above 8192 seats the read call's a, b ramped up between 34.2 and 36.9 GB pinned (a x 1.64, b x 1.04 at the top) — the engine serialising an expert's preads across store chunks (issue 09); fixed in issue 10, after which a, b are flat to 13200 seats. | The engine issues one threaded read pass per store chunk; past that size the pool's band regions stop sharing a Metal chunk and an expert's two preads serialise (issue 09). Not a host effect: measured flat against alignment, pressure, destination size and virgin pages. |
 
+## How to repeat this
+
+`METHOD.md` is the manual: pre-flight, the four conditionings with their gates, the measurement
+protocol, the five configurations, the fit, and a porting section for another machine, model or
+batch size. The issues below are its evidence, cited from it as "(why: issue NN)" — read one only
+when the manual sends you.
+
 ## Plan
 
 - 01 scaffolding: `stepmodel.py`, this spec, `macmon` for a direct GPU-frequency reading.
