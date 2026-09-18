@@ -4059,8 +4059,8 @@ impl engine::frame::Shell for Shell {
             }
             let walked = self.walk_streamed(&prepared);
             if let (Some(rows), Some(tier)) = (self.weights.rows(), self.weights.tier()) {
-                let (read, missed) = rows.borrow().this_fire();
-                tier.borrow_mut().note_rows_read(read, missed);
+                let (read, missed, read_ms) = rows.borrow().this_fire();
+                tier.borrow_mut().note_rows_read(read, missed, read_ms);
             }
             // The fire is over however it went: the ring goes back to the
             // pool and the tier counts what the fire cost it before anything

@@ -104,6 +104,8 @@ pub struct FireRecord {
     /// the prefetch had not already landed (read at the cut instead).
     pub ple_reads: u64,
     pub ple_prefetch_misses: u64,
+    /// Of `ple_ms`, the part inside the pread itself.
+    pub ple_read_ms: f64,
     /// Wall clock as this fire opened, ms since the load's first fire. The
     /// step a decode takes is the gap between two of these, which is the
     /// only way to read a step off one request rather than by subtracting
@@ -144,7 +146,7 @@ pub(super) fn open_log(path: Option<&std::path::Path>) {
         let _ = writeln!(
             file,
             "seq,rows,cuts,copies,hits,misses,bytes_read,cut_ms,copy_ms,wait_ms,walk_ms,\
-             gpu_cut_ms,gpu_tail_ms,t_ms,ple_ms,ple_reads,ple_prefetch_misses"
+             gpu_cut_ms,gpu_tail_ms,t_ms,ple_ms,ple_reads,ple_prefetch_misses,ple_read_ms"
         );
         let _ = file.flush();
         Some(std::sync::Mutex::new((0, file)))
@@ -223,7 +225,7 @@ pub fn log_fire(record: &FireRecord) {
     let (seq, file) = &mut *log;
     let _ = writeln!(
         file,
-        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
+        "{seq},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{},{:.3}",
         record.rows,
         record.cuts,
         record.copies,
@@ -240,6 +242,7 @@ pub fn log_fire(record: &FireRecord) {
         record.ple_ms,
         record.ple_reads,
         record.ple_prefetch_misses,
+        record.ple_read_ms,
     );
     let _ = file.flush();
     *seq += 1;
@@ -282,6 +285,7 @@ pub(super) struct Tally {
     /// This fire's n-gram row reads, and how many the prefetch missed.
     pub(super) rows_read: u64,
     pub(super) rows_missed: u64,
+    pub(super) rows_read_ms: f64,
     /// When the load's first fire opened, and when this one did.
     first: Option<std::time::Instant>,
     at_ms: f64,
@@ -353,6 +357,7 @@ impl Tally {
             ple_ms: (self.rows_ns - at.rows_ns) as f64 / 1e6,
             ple_reads: std::mem::take(&mut self.rows_read),
             ple_prefetch_misses: std::mem::take(&mut self.rows_missed),
+            ple_read_ms: std::mem::take(&mut self.rows_read_ms),
         }
     }
 

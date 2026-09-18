@@ -370,7 +370,7 @@ pub struct Slab {
     seat_of: HashMap<i32, u32>,
     /// Rows a prefetch is landing, resident once the read is joined.
     pending: HashMap<i32, u32>,
-    inflight: Option<std::thread::JoinHandle<Result<()>>>,
+    inflight: Option<std::thread::JoinHandle<Result<u64>>>,
     in_seat: Vec<i32>,
     next: u32,
     fires: u64,
@@ -382,6 +382,10 @@ pub struct Slab {
     missed: u64,
     reads_at: u64,
     missed_at: u64,
+    /// Host time spent inside the pread itself (prefetch thread and cut alike),
+    /// apart from the seating and the join around it.
+    read_ns: u64,
+    read_ns_at: u64,
 }
 
 impl Slab {
@@ -442,6 +446,8 @@ impl Slab {
             missed: 0,
             reads_at: 0,
             missed_at: 0,
+            read_ns: 0,
+            read_ns_at: 0,
         })
     }
 
@@ -467,12 +473,18 @@ impl Slab {
         self.fires += 1;
         self.reads_at = self.reads;
         self.missed_at = self.missed;
+        self.read_ns_at = self.read_ns;
     }
 
-    /// This fire's rows read, and how many the prefetch missed.
+    /// This fire's rows read, how many the prefetch missed, and the host time
+    /// the reads themselves took.
     #[must_use]
-    pub fn this_fire(&self) -> (u64, u64) {
-        (self.reads - self.reads_at, self.missed - self.missed_at)
+    pub fn this_fire(&self) -> (u64, u64, f64) {
+        (
+            self.reads - self.reads_at,
+            self.missed - self.missed_at,
+            (self.read_ns - self.read_ns_at) as f64 / 1e6,
+        )
     }
 
     /// Name and land the rows this fire will ask for, before the device
@@ -537,7 +549,9 @@ impl Slab {
         self.reads += jobs.len() as u64 / self.bands.len().max(1) as u64;
         let writers = self.store.file_writers(&jobs)?;
         self.inflight = Some(std::thread::spawn(move || {
-            crate::device::alloc::FileWriter::pread_many(&file, &writers, ROW_THREADS)
+            let started = std::time::Instant::now();
+            let landed = crate::device::alloc::FileWriter::pread_many(&file, &writers, ROW_THREADS);
+            landed.map(|()| started.elapsed().as_nanos() as u64)
         }));
         Ok(())
     }
@@ -554,7 +568,8 @@ impl Slab {
         });
         let pending = std::mem::take(&mut self.pending);
         match landed {
-            Ok(()) => {
+            Ok(read_ns) => {
+                self.read_ns += read_ns;
                 self.copies += pending.len() as u64 * self.bands.len() as u64;
                 self.seat_of.extend(pending);
                 Ok(())
@@ -653,7 +668,9 @@ impl Slab {
             let file = self.file.clone().ok_or_else(|| {
                 Fault::Residency("n-gram rows by pread want the artifact's file".to_string())
             })?;
+            let started = std::time::Instant::now();
             self.store.write_from_file(&file, &jobs, ROW_THREADS)?;
+            self.read_ns += started.elapsed().as_nanos() as u64;
             self.copies += jobs.len() as u64;
         }
         self.reads += landing.len() as u64;
