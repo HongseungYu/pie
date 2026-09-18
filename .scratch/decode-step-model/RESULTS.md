@@ -18,7 +18,20 @@ thermal state and memory before, during and after).
 | host asleep between reads | a call 0.35 ms when dense, 0.83 when rare (issue 03) | one thread spinning | `PIE_METAL_CPU_HEATER=1` |
 | n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | read them by uncached pread at known offsets, prefetched as the fire opens (issue 08) | `PIE_PLE_SOURCE=pread PIE_PLE_PREFETCH=1` (defaults) |
 
-## Update 2026-09-18: above 8192 seats, up to 13200 (~42 GB pinned) — issue 09
+## Update 2026-09-18 (later): the ramp above 8192 seats was the engine's, and is gone — issue 10
+
+`Store::write_from_file` took one threaded pass a store chunk; once the pool's `gate_up` and
+`down` regions stopped sharing a Metal chunk (past 10240 seats here), an expert's six preads
+ran as two serial triples. One pass over every chunk (`FileWriter::pread_many`) brings a
+one-miss call from 0.99-1.01 ms back to 0.74 at 11264 and 13200 (8192, one chunk: unchanged),
+and the natural windows at 11264 / 13200 now fit the flat model at -1.75% / -1.77%:
+
+    step_ms = 37.05 + sum over layers with m_l >= 1 of ( 0.368 + 0.1360 * m_l * 2.637 )    valid to 13200 seats
+
+Config: `out/sim/configs/mac_m4pro_qwen38flash_np1_v5.json`. The section below describes the
+engine before that commit.
+
+## Update 2026-09-18: above 8192 seats, up to 13200 (~42 GB pinned) — issue 09 (before the fix)
 
 The read call steps up above 10240 seats: a one-miss call 0.70 ms through 10240, 0.96-1.02 from
 11264 on. **The cause is the engine, not the host** — `Store::write_from_file` issues one
