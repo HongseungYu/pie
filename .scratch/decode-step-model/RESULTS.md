@@ -18,6 +18,21 @@ thermal state and memory before, during and after).
 | host asleep between reads | a call 0.35 ms when dense, 0.83 when rare (issue 03) | one thread spinning | `PIE_METAL_CPU_HEATER=1` |
 | n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | read them by uncached pread at known offsets, prefetched as the fire opens (issue 08) | `PIE_PLE_SOURCE=pread PIE_PLE_PREFETCH=1` (defaults) |
 
+## Update 2026-09-18: above 8192 seats, up to 13200 (~42 GB pinned) — issue 09
+
+The read call steps up once the pinned memory has taken the host's last ~2 GB of reclaimable
+pages: a one-miss call 0.70 ms through 10240 seats, 0.96-1.02 from 11264 on (not swap I/O —
+no run swapped out; the uncached read's pages come off the reclaim path). Floor, device time
+and the n-gram join do not move. Modelled as a ramp, continuous with the model below:
+
+    P  = pinned GB = N x 2.637 MiB + 6.5 GB (planes, arena, KV, tables; ~1.5 GB of other resident memory beside)
+    r  = clamp((P - 34.2) / 2.7, 0, 1)          (N = 10240 -> 0, N = 11264 -> 1 on this box)
+    a(P) = 0.368 x (1 + 0.64 r)     b(P) = 0.1360 x (1 + 0.04 r) ms/MiB     floor = 37.05 (unchanged)
+    step = floor + sum over layers with m_l >= 1 of ( a(P) + b(P) x m_l x 2.637 )
+
+Natural windows 9216-13200 within -0.4 .. -1.7% (clean steps; two runs met drive stalls, shown
+in issue 09). Config: `out/sim/configs/mac_m4pro_qwen38flash_np1_v4.json` (`read_model_ramp`).
+
 ## Update 2026-09-18: n-gram rows off the SSD, prefetched (issue 08)
 
 The PLE rows are now read by uncached pread at offsets known from the load and prefetched as
