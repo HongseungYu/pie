@@ -53,6 +53,7 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 | 10 | a, b are the minimax pick over the four configurations' windows; the planted grid checks the form's structure but not its coefficients. | The drive's cache serves a planted re-read below a cold miss's price (issue 07). |
 | 11 | A step whose reads cost > 1.5x the drive's curve is a drive stall and set aside, counted and shown; runs spoiled whole are rerun and the originals kept. | The drive pauses for seconds every ten minutes or so; no fixed a, b can carry it (issue 07). |
 | 12 | Reads within seconds of a 55 GiB prefill burst (the 128-token `all_in_mem` window) are a fifth regime, reported apart. | 0.60 ms a miss against 0.53; the drive's, not the engine's. |
+| 13 | The n-gram rows are read by uncached pread at offsets known from the load, prefetched as the fire opens from host-computed ids; no separate file (issue 08). | Their cost was the page cache's; now 0.02 ms a step, constant. The floor is 37.05. |
 
 ## Plan
 
@@ -63,3 +64,4 @@ The parameters are tuned; the form is kept unless a term is provably missing.
 - 05 the largest pool the host can spare (memory pressure, the n-gram page cache).
 - 06 a pool at the floor refuses a second prefill (fixed).
 - 07 the fit and the four configurations; `RESULTS.md` and `out/sim/configs/mac_m4pro_qwen38flash_np1_v2.json`.
+- 08 the n-gram rows off the SSD every time, prefetched; the floor re-measured (`..._v3.json`).

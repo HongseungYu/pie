@@ -16,9 +16,21 @@ thermal state and memory before, during and after).
 |---|---|---|---|
 | GPU heater's own kernels beside the frames | cut frames 30.6 ms at no misses, 43.4 at 331, clock at 1578 MHz throughout (issue 02) | a narrow ALU kernel at every gap | `PIE_METAL_HEATER=on PIE_METAL_HEATER_ARM=always PIE_METAL_HEATER_KERNEL=alu` |
 | host asleep between reads | a call 0.35 ms when dense, 0.83 when rare (issue 03) | one thread spinning | `PIE_METAL_CPU_HEATER=1` |
-| n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | pool <= 9216 seats; warm the sequence first | (measurement protocol) |
+| n-gram (PLE) rows faulting from disk | 6-7 ms a step at pools >= 9216 that page the host, or on a sequence's first pass (issue 05) | read them by uncached pread at known offsets, prefetched as the fire opens (issue 08) | `PIE_PLE_SOURCE=pread PIE_PLE_PREFETCH=1` (defaults) |
 
-## Parameters
+## Update 2026-09-18: n-gram rows off the SSD, prefetched (issue 08)
+
+The PLE rows are now read by uncached pread at offsets known from the load and prefetched as
+the fire opens (`PIE_PLE_SOURCE=pread`, `PIE_PLE_PREFETCH=1`, the defaults). The page-cache
+term is gone from F: the floor is **37.05 ms** (C 32.86 + F 4.19; n-gram rows 0.02 ms, zero
+prefetch misses), a, b unchanged. Rerun table in issue 08 (`sm4-*`): floor pool +0.5 / -4.0
+(a drive-slow rep), min-miss pool -1.4 / -1.1, zero misses -0.8 / +0.4 / +0.3, mid 3072 -0.0,
+6144 -0.5. Simulator config: `out/sim/configs/mac_m4pro_qwen38flash_np1_v3.json`. The pool
+limit stays at 8192: above it the host's memory pressure now slows the reads themselves.
+
+    step_ms = 37.05 + sum over layers with m_l >= 1 of ( 0.368 + 0.1360 * m_l * 2.637 )
+
+## Parameters (as first measured, 2026-09-17, before issue 08)
 
     step_ms = 37.69 + sum over layers with m_l >= 1 of ( 0.368 + 0.1360 * m_l * 2.637 )
 
