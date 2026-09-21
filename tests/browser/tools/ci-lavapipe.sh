@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../.."
 
 work=${PIE_LAVAPIPE_WORK:-$(mktemp -d)}
 export PIE_HOME="$work/home"
