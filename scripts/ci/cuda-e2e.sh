@@ -48,30 +48,17 @@ echo "== compat API suite"
 uv run --with openai --with anthropic --with google-genai python tests/builtins/test_compat.py --base-url "http://127.0.0.1:$port"
 
 echo "== install, replace and remove while serving"
-submit() { uv run --project python/client python - "$@" <<'PY'
-import asyncio, sys
-from pie_client import PieClient
-async def main():
-    async with PieClient(f"ws://127.0.0.1:{sys.argv[2]}") as c:
-        await c.authenticate("ci", None)
-        try:
-            p = await c.launch_process(sys.argv[1], {"prompt": "The capital of France is", "max_tokens": 4})
-            print("ok", str(await p.result())[:60])
-        except Exception as e:
-            print("error", str(e).splitlines()[0][:80])
-asyncio.run(main())
-PY
-}
+submit() { uv run --project python/client python scripts/ci/launch.py "ws://127.0.0.1:$port" "$1" || true; }
 tc=examples/target/wasm32-wasip2/release/text_completion.wasm
 nb=examples/target/wasm32-wasip2/release/naive_baseline.wasm
 man=examples/text-completion/Pie.toml
-submit text-completion "$port" | grep -q '^error' || { echo "expected: not installed"; exit 1; }
+submit text-completion | grep -q '^error' || { echo "expected: not installed"; exit 1; }
 "$pie" inferlet install "$tc" -m "$man"
-submit text-completion "$port" | grep -q "^ok.*Paris" || { echo "expected: Paris"; exit 1; }
+submit text-completion | grep -q "^ok.*Paris" || { echo "expected: Paris"; exit 1; }
 "$pie" inferlet install "$nb" -m "$man" --force
-submit text-completion "$port" | grep -q "^ok.*sampler" || { echo "expected: the replacement's output"; exit 1; }
+submit text-completion | grep -q "^ok.*sampler" || { echo "expected: the replacement's output"; exit 1; }
 "$pie" inferlet remove text-completion@0.3.0
-submit text-completion "$port" | grep -q '^error' || { echo "expected: removed"; exit 1; }
+submit text-completion | grep -q '^error' || { echo "expected: removed"; exit 1; }
 if grep -q 'panicked at' "$log"; then echo "the server panicked"; grep -A3 'panicked at' "$log"; exit 1; fi
 kill $serve; wait $serve 2>/dev/null || true
 

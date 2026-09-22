@@ -22,6 +22,7 @@ permissions:
 
 jobs:
   pure:
+    name: "${{ inputs.package }}: build"
     if: inputs.package != 'pie-server'
     runs-on: ubuntu-latest
     env:
@@ -69,7 +70,7 @@ jobs:
 
   wheel:
     if: inputs.package == 'pie-server'
-    name: wheel (${{ matrix.target.label }})
+    name: "pie-server: wheel (${{ matrix.target.label }})"
     strategy:
       fail-fast: false
       matrix:
@@ -106,6 +107,7 @@ jobs:
           if-no-files-found: error
 
   sdist:
+    name: "pie-server: sdist"
     if: inputs.package == 'pie-server'
     runs-on: ubuntu-latest
     steps:
@@ -122,6 +124,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: "pypi: check + publish"
     needs: [pure, wheel, sdist]
     if: >-
       always() && !cancelled()

@@ -27,6 +27,7 @@ env:
 
 jobs:
   browser:
+    name: "browser: build"
     if: inputs.package == 'browser'
     runs-on: ubuntu-latest
     steps:
@@ -51,7 +52,7 @@ jobs:
 
   addon:
     if: inputs.package == 'server'
-    name: addon (${{ matrix.target.npm }})
+    name: "server: addon (${{ matrix.target.npm }})"
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +83,7 @@ jobs:
           if-no-files-found: error
 
   publish:
+    name: "npm: check + publish"
     needs: [browser, addon]
     if: >-
       always() && !cancelled()
