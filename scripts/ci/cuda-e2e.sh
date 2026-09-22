@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PIE_HOME="${PIE_HOME:-$HOME/.pie}"
 port=${PIE_E2E_PORT:-18517}
-pie=target/debug/pie
+pie=${CARGO_TARGET_DIR:-target}/debug/pie
 
 cargo build -p pie --features cuda --bin pie
 (cd examples && cargo build -q --release --target wasm32-wasip2 -p text-completion -p naive-baseline)

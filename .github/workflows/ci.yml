@@ -322,23 +322,24 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
-      - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
+      - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv && df -h /workspace
       - run: cargo test -p engine-cuda --features cuda --no-run --all-targets
       - run: cargo test -p engine-cuda --features cuda -- --ignored
       - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |
-          ldd target/debug/pie
-          ! ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt"
+          ldd "${CARGO_TARGET_DIR:-target}/debug/pie"
+          ! ldd "${CARGO_TARGET_DIR:-target}/debug/pie" | grep -E "libcudart|libcublas|libcublasLt"
 
   cuda-down:
     name: "cuda: stop the pod"
-    needs: cuda
+    needs: [cuda-up, cuda]
     if: always() && needs.cuda-up.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - run: bash scripts/ci/runpod.sh stop
         env:
+          GH_TOKEN: ${{ github.token }}
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}

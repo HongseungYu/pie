@@ -34,7 +34,7 @@ echo "== import"
 
 case "$engine" in
   wgpu)   engine_toml=$'type = "wgpu"\nbackends = "vulkan"\ndevice = ["wgpu:0"]' ;;
-  vulkan) engine_toml=$'type = "vulkan"\ndevice_index = 0' ;;
+  vulkan) engine_toml=$'type = "vulkan"\ndevice = ["vulkan:0"]\ndevice_index = 0' ;;
   *) echo "PIE_ENGINE must be wgpu or vulkan"; exit 2 ;;
 esac
 cat > "$PIE_HOME/config.toml" <<TOML
