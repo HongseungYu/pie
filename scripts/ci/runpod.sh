@@ -6,11 +6,13 @@
 #   runpod.sh start | stop | status
 set -euo pipefail
 api="https://rest.runpod.io/v1/pods/${RUNPOD_POD_ID:?}"
-call() { curl -fsS -X "$1" -H "Authorization: Bearer ${RUNPOD_API_KEY:?}" -H "Content-Type: application/json" "$api$2"; }
+call() { curl -sS --fail-with-body -X "$1" -H "Authorization: Bearer ${RUNPOD_API_KEY:?}" -H "Content-Type: application/json" "$api$2"; }
 status() { call GET "" | jq -r '"\(.desiredStatus) gpu=\(.machine.gpuTypeId // .gpu // "-") uptime=\(.runtime.uptimeInSeconds // 0)s"'; }
 case "${1:?start|stop|status}" in
   status) status ;;
   start)
+    s=$(status); echo "$s"
+    case "$s" in RUNNING*) exit 0 ;; esac
     call POST /start >/dev/null
     # A stopped pod resumes only when its host has the GPU free; say so
     # rather than leaving the job to queue for a runner that never comes.
