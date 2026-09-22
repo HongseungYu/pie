@@ -234,18 +234,43 @@ jobs:
       - run: cargo run -q -p kernels-wgpu --example dump_wgsl -- crates/kernels-wgpu/tools/wgsl
       - run: PIE_CHROME_ARGS="--use-webgpu-adapter=swiftshader --enable-unsafe-swiftshader" node tests/browser/tools/headless.mjs . crates/kernels-wgpu/tools/wgsl-check.html --timeout 900000
 
-  # The one runner with a GPU; opt in with the `ci-cuda` label.
-  cuda:
-    name: engine-cuda on hardware
-    runs-on: [self-hosted, cuda]
-    if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
+  # The GPU runner is a RunPod pod that sleeps between runs: `cuda-up` resumes
+  # it, the pod registers an ephemeral `self-hosted,cuda` runner, `cuda-down`
+  # stops it. Runs on main and on PRs labelled `ci-cuda`, once the repo has
+  # RUNPOD_POD_ID (variable) and RUNPOD_API_KEY (secret).
+  cuda-up:
+    if: vars.RUNPOD_POD_ID != '' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci-cuda'))
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/ci/runpod.sh start
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}
+
+  cuda:
+    name: "cuda: serve on hardware"
+    needs: cuda-up
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - run: nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv
       - run: cargo test -p engine-cuda --features cuda --no-run --all-targets
       - run: cargo test -p engine-cuda --features cuda -- --ignored
-      - run: cargo build -p pie --features cuda
+      - run: bash scripts/ci/cuda-e2e.sh
       - name: no CUDA shared library is linked
         run: |
           ldd target/debug/pie
           ! ldd target/debug/pie | grep -E "libcudart|libcublas|libcublasLt"
+
+  cuda-down:
+    needs: cuda
+    if: always() && needs.cuda-up.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash scripts/ci/runpod.sh stop
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          RUNPOD_POD_ID: ${{ vars.RUNPOD_POD_ID }}
