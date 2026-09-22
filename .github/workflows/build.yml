@@ -146,7 +146,7 @@ jobs:
         run: |
           $env:PIE_VERSION = "${{ inputs.tag }}"; $env:PIE_FLAVOR = "vulkan"
           ./scripts/install.ps1
-          $env:PATH = "$env:LOCALAPPDATA\Programs\pie;$env:USERPROFILE\.local\bin;$env:PATH"
+          $env:PATH = "$env:LOCALAPPDATA\Pie\bin;$env:PATH"
           pie --version
           pie language list
 
